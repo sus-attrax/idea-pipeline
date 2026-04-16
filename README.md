@@ -41,7 +41,7 @@ export IDEAPIPE_VAULT=~/vaults/idea-validation
 | 2 | Schemas (db-based detection) | ✓ | Type-safe Daten, `schema check` |
 | 3 | Vault-IO (read/write/list/doctor) | ✓ | atomare Vault-Operationen |
 | 4 | Validation-Vault aufsetzen | TODO | echte Notizen importiert |
-| 5 | Idea-Intake CLI (`ingest`) | TODO | aus Liste → Idee-Stubs |
+| 5 | Idea-Intake CLI (`ingest`) | ✓ | aus Liste → Idee-Stubs |
 | 6 | LLM-Enrichment: Chancen-Generierung | TODO | LLM erzeugt Chance-Stubs |
 | 7 | LLM-Linking: Idee↔Chance↔Wissen | TODO | LLM verknüpft Notizen |
 | 8 | T0 Scoring (vault-only) | TODO | erstes Leaderboard |

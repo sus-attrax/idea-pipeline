@@ -4,6 +4,7 @@ Commands grow with each pipeline step:
   Step 1: hello, info
   Step 2: schema check, schema check-dir
   Step 3: vault read, vault list, vault doctor
+  Step 5: ingest (create notes from name:description pairs)
 
 Each command is an isolated, idempotent step — the contract between
 you (and later, Claude Code) and the system.
@@ -11,6 +12,7 @@ you (and later, Claude Code) and the system.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,7 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
+from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
 from idea_pipeline.schemas import (
     BaseNote,
     ChanceNote,
@@ -386,6 +389,111 @@ def vault_write_test(
             shutil.move(str(backup), str(file))
             console.print(f"[dim]Original restored from backup.[/dim]")
         console.print(f"[red]✗ Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# --- Ingest commands ---------------------------------------------------------
+
+@app.command("ingest")
+def ingest_cmd(
+    text: Optional[str] = typer.Argument(
+        None,
+        help='Inline "name: description" (one idea). For multiple, use --file or --stdin.',
+    ),
+    file: Optional[Path] = typer.Option(
+        None, "--file", "-f",
+        help="File with one 'name: description' per line",
+    ),
+    stdin: bool = typer.Option(
+        False, "--stdin",
+        help="Read from stdin (for piping)",
+    ),
+    note_type: str = typer.Option(
+        "idee", "--type", "-t",
+        help="Note type to create: idee, chance, wissen",
+    ),
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Preview what would be created without writing files",
+    ),
+) -> None:
+    """Create vault notes from name:description pairs.
+
+    Three ways to provide input:
+
+      # Single idea inline
+      ideapipe ingest "urban_mushroom_farm: growing gourmet mushrooms in urban basements"
+
+      # Multiple from a file (one per line)
+      ideapipe ingest --file ideas.txt
+
+      # Piped from another command or Claude Code
+      echo "idea1: desc1" | ideapipe ingest --stdin
+
+    File format (one per line):
+      name: description text here
+      another_name: another description
+      # lines starting with # are comments
+
+    Idempotent: existing files are skipped, never overwritten.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    # Resolve input source
+    if file:
+        if not file.exists():
+            console.print(f"[red]✗ File not found:[/red] {file}")
+            raise typer.Exit(1)
+        input_text = file.read_text(encoding="utf-8")
+    elif stdin:
+        input_text = sys.stdin.read()
+    elif text:
+        input_text = text
+    else:
+        console.print(
+            "[red]✗ No input.[/red] Provide inline text, --file, or --stdin.\n"
+            "[dim]Example: ideapipe ingest \"my_idea: a great business idea\"[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Preview
+    items = parse_ingest_input(input_text)
+    if not items:
+        console.print("[yellow]No items parsed from input.[/yellow]")
+        raise typer.Exit(0)
+
+    if dry_run:
+        console.print(f"[bold]Dry run[/bold] — would create {len(items)} {note_type} note(s):\n")
+        for item in items:
+            target = vault_path / f"{item.filename}.md"
+            exists = target.exists()
+            status = "[dim]SKIP (exists)[/dim]" if exists else "[green]CREATE[/green]"
+            desc_preview = (item.description[:50] + "...") if len(item.description) > 50 else item.description
+            console.print(f"  {status} {item.filename}.md — {desc_preview or '[no description]'}")
+        return
+
+    # Execute
+    result = ingest(input_text, vault_path, note_type=note_type)
+
+    # Report
+    if result.created:
+        console.print(f"[bold green]✓ Created {len(result.created)} note(s):[/bold green]")
+        for fn in result.created:
+            console.print(f"  [green]+[/green] {fn}.md")
+
+    if result.skipped:
+        console.print(f"[dim]Skipped {len(result.skipped)} (already exist):[/dim]")
+        for fn in result.skipped:
+            console.print(f"  [dim]–[/dim] {fn}.md")
+
+    if result.errors:
+        console.print(f"[red]Errors ({len(result.errors)}):[/red]")
+        for fn, msg in result.errors:
+            console.print(f"  [red]✗[/red] {fn}: {msg}")
         raise typer.Exit(1)
 
 
