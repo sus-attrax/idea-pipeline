@@ -1,18 +1,18 @@
 """CLI entry point for the idea pipeline.
 
-Each command is one isolated, idempotent pipeline step.
-This is the contract that you (and later, Claude via Claude Code) use
-to drive the system.
-
 Commands grow with each pipeline step:
   Step 1: hello, info
   Step 2: schema check, schema check-dir
-  ...
+  Step 3: vault read, vault list, vault doctor
+
+Each command is an isolated, idempotent step — the contract between
+you (and later, Claude Code) and the system.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import frontmatter
 import typer
@@ -20,7 +20,23 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
-from idea_pipeline.schemas import detect_note_type
+from idea_pipeline.schemas import (
+    BaseNote,
+    ChanceNote,
+    IdeeNote,
+    WissenNote,
+    detect_note_type,
+)
+from idea_pipeline.settings import get_vault_path
+from idea_pipeline.vault_io import (
+    DoctorFinding,
+    ListResult,
+    VaultNote,
+    check_vault_health,
+    list_notes,
+    read_note,
+    write_note,
+)
 
 app = typer.Typer(
     name="ideapipe",
@@ -30,14 +46,12 @@ app = typer.Typer(
 )
 console = Console()
 
-schema_app = typer.Typer(help="Schema validation utilities.", no_args_is_help=True)
-app.add_typer(schema_app, name="schema")
-
+# --- Top-level commands ------------------------------------------------------
 
 @app.command()
 def hello(name: str = "Meister") -> None:
-    """Smoke test — proves the CLI is wired up correctly."""
-    console.print(f"[bold green]✓[/bold green] Pipeline-Skeleton lebt. Hallo, {name}.")
+    """Smoke test."""
+    console.print(f"[bold green]✓[/bold green] Pipeline lebt. Hallo, {name}.")
 
 
 @app.command()
@@ -45,31 +59,37 @@ def info() -> None:
     """Show pipeline status and configured paths."""
     from idea_pipeline import __version__
 
+    vault = get_vault_path()
     console.print(f"[bold]idea-pipeline[/bold] v{__version__}")
-    console.print("[dim]Vault path noch nicht konfiguriert (Step 4).[/dim]")
+    console.print(f"Vault path: [cyan]{vault}[/cyan]")
+    if vault.is_dir():
+        md_count = len(list(vault.glob("*.md")))
+        console.print(f"Notes found: {md_count}")
+    else:
+        console.print("[yellow]Vault directory does not exist yet.[/yellow]")
+
+
+# --- Schema commands ---------------------------------------------------------
+
+schema_app = typer.Typer(help="Schema validation utilities.", no_args_is_help=True)
+app.add_typer(schema_app, name="schema")
 
 
 def _validate_one(file: Path) -> tuple[str, object | None, str | None]:
-    """Validate one note. Returns (status, model_or_None, error_msg_or_None).
-
-    Status values: 'valid', 'invalid', 'unknown_type'
-    """
+    """Validate one note. Returns (status, model_or_None, error_msg_or_None)."""
     try:
         post = frontmatter.load(file)
     except Exception as e:
         return ("invalid", None, f"frontmatter parse failed: {e}")
-
     schema_cls = detect_note_type(post.metadata)
     if schema_cls is None:
         return ("unknown_type", None, None)
-
     try:
         data = dict(post.metadata)
-        data["id"] = file.stem  # ID derived from filename, never from YAML
+        data["id"] = file.stem
         note = schema_cls.model_validate(data)
         return ("valid", note, None)
     except ValidationError as e:
-        # First error message is usually the most useful
         first_err = e.errors()[0]
         loc = ".".join(str(p) for p in first_err["loc"])
         return ("invalid", None, f"{loc}: {first_err['msg']}")
@@ -78,62 +98,44 @@ def _validate_one(file: Path) -> tuple[str, object | None, str | None]:
 @schema_app.command("check")
 def schema_check(
     file: Path = typer.Argument(..., help="Path to a markdown note file"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show parsed model"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Validate a single markdown note against its appropriate schema.
-
-    The schema class is auto-detected from the note's `database` field
-    in the YAML frontmatter:
-      database: [[geschaeftsideen🎲]] → IdeeNote
-      database: [[chancen🌋]]          → ChanceNote
-      database: [[wissen🤯]]           → WissenNote
-    """
+    """Validate a single note against its detected schema."""
     if not file.exists():
         console.print(f"[red]✗ File not found:[/red] {file}")
         raise typer.Exit(1)
 
     status, note, err = _validate_one(file)
-
     if status == "unknown_type":
-        console.print(
-            f"[yellow]?[/yellow] {file.name}: cannot detect type "
-            f"(no recognized [bold]database[/bold] field)"
-        )
+        console.print(f"[yellow]?[/yellow] {file.name}: no recognized database field")
         raise typer.Exit(2)
     if status == "invalid":
         console.print(f"[red]✗[/red] {file.name}: {err}")
         raise typer.Exit(1)
 
     cls_name = type(note).__name__
-    console.print(f"[bold green]✓[/bold green] {file.name} valid as [bold]{cls_name}[/bold]")
+    console.print(f"[bold green]✓[/bold green] {file.name} → [bold]{cls_name}[/bold]")
 
     if verbose:
         table = Table(show_header=True, header_style="bold cyan")
         table.add_column("Field", style="dim")
         table.add_column("Value")
-        for field_name, field_value in note.model_dump().items():
-            if field_value is None or field_value == [] or field_value == "":
+        for fn, fv in note.model_dump().items():
+            if fv is None or fv == [] or fv == "":
                 continue
-            # Truncate long descriptions for readability
-            val_str = str(field_value)
+            val_str = str(fv)
             if len(val_str) > 100:
                 val_str = val_str[:97] + "..."
-            table.add_row(field_name, val_str)
+            table.add_row(fn, val_str)
         console.print(table)
 
 
 @schema_app.command("check-dir")
 def schema_check_dir(
-    directory: Path = typer.Argument(..., help="Directory containing markdown notes"),
-    show_unknown: bool = typer.Option(
-        False, "--show-unknown", help="List files with no detectable type"
-    ),
+    directory: Path = typer.Argument(..., help="Directory of markdown notes"),
+    show_unknown: bool = typer.Option(False, "--show-unknown"),
 ) -> None:
-    """Validate all .md notes in a directory (flat structure).
-
-    Reports valid / invalid / unknown_type counts.
-    Exit code is non-zero if any file is invalid (good for CI).
-    """
+    """Batch-validate all .md notes in a directory."""
     if not directory.is_dir():
         console.print(f"[red]✗ Not a directory:[/red] {directory}")
         raise typer.Exit(1)
@@ -143,44 +145,247 @@ def schema_check_dir(
         console.print(f"[yellow]No .md files found in {directory}[/yellow]")
         raise typer.Exit(0)
 
-    valid = 0
-    invalid_list: list[tuple[str, str]] = []
-    unknown_list: list[str] = []
-    counts_by_type: dict[str, int] = {}
+    valid, invalid_list, unknown_list = 0, [], []
+    counts: dict[str, int] = {}
 
     for f in files:
         status, note, err = _validate_one(f)
         if status == "valid":
             valid += 1
-            cls_name = type(note).__name__
-            counts_by_type[cls_name] = counts_by_type.get(cls_name, 0) + 1
+            cn = type(note).__name__
+            counts[cn] = counts.get(cn, 0) + 1
         elif status == "invalid":
-            invalid_list.append((f.name, err or "unknown error"))
+            invalid_list.append((f.name, err or "unknown"))
         else:
             unknown_list.append(f.name)
 
-    # Summary
     console.print(
-        f"\n[bold]Summary[/bold] across {len(files)} files: "
+        f"\n[bold]Summary[/bold] ({len(files)} files): "
         f"[green]{valid} valid[/green] · "
         f"[red]{len(invalid_list)} invalid[/red] · "
-        f"[dim]{len(unknown_list)} unknown type[/dim]"
+        f"[dim]{len(unknown_list)} unknown[/dim]"
     )
-    if counts_by_type:
-        breakdown = " · ".join(f"{k}: {v}" for k, v in sorted(counts_by_type.items()))
-        console.print(f"[dim]Breakdown: {breakdown}[/dim]")
-
+    if counts:
+        console.print(f"[dim]{' · '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}[/dim]")
     if invalid_list:
         console.print("\n[bold red]Invalid:[/bold red]")
-        for filename, msg in invalid_list:
-            console.print(f"  [red]✗[/red] {filename}: {msg}")
-
+        for fn, msg in invalid_list:
+            console.print(f"  [red]✗[/red] {fn}: {msg}")
     if show_unknown and unknown_list:
-        console.print("\n[bold yellow]Unknown type (skipped):[/bold yellow]")
-        for filename in unknown_list:
-            console.print(f"  [yellow]?[/yellow] {filename}")
-
+        console.print("\n[bold yellow]Unknown type:[/bold yellow]")
+        for fn in unknown_list:
+            console.print(f"  [yellow]?[/yellow] {fn}")
     if invalid_list:
+        raise typer.Exit(1)
+
+
+# --- Vault commands ----------------------------------------------------------
+
+vault_app = typer.Typer(help="Read, list, and inspect vault notes.", no_args_is_help=True)
+app.add_typer(vault_app, name="vault")
+
+# Reusable vault path option
+_vault_option = typer.Option(
+    None, "--vault", "-V",
+    help="Vault directory (default: $IDEAPIPE_VAULT or ~/vaults/idea-validation)",
+)
+
+_TYPE_MAP = {"idee": IdeeNote, "chance": ChanceNote, "wissen": WissenNote}
+
+
+@vault_app.command("read")
+def vault_read(
+    file: Path = typer.Argument(..., help="Path to a note file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Read a single note and display its parsed data."""
+    try:
+        vnote = read_note(file)
+    except (FileNotFoundError, ValueError, ValidationError) as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+    model = vnote.model
+    cls_name = type(model).__name__
+    console.print(f"[bold green]✓[/bold green] {file.name} → [bold]{cls_name}[/bold] (id: {model.id})")
+
+    if vnote.body:
+        body_preview = vnote.body[:80].replace("\n", " ")
+        if len(vnote.body) > 80:
+            body_preview += "..."
+        console.print(f"[dim]Body: {body_preview}[/dim]")
+
+    if verbose:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Field", style="dim")
+        table.add_column("Value")
+        for fn, fv in model.model_dump().items():
+            if fv is None or fv == [] or fv == "":
+                continue
+            val_str = str(fv)
+            if len(val_str) > 120:
+                val_str = val_str[:117] + "..."
+            table.add_row(fn, val_str)
+        console.print(table)
+
+
+@vault_app.command("list")
+def vault_list(
+    vault: Optional[Path] = _vault_option,
+    note_type: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="Filter by type: idee, chance, wissen",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """List all notes in the vault, optionally filtered by type."""
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    type_cls = None
+    if note_type:
+        type_cls = _TYPE_MAP.get(note_type.lower())
+        if type_cls is None:
+            console.print(f"[red]✗ Unknown type:[/red] {note_type}. Use: idee, chance, wissen")
+            raise typer.Exit(1)
+
+    lr = list_notes(vault_path, note_type=type_cls)
+
+    # Print notes
+    if not lr.notes:
+        console.print("[yellow]No matching notes found.[/yellow]")
+    else:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("ID", style="bold")
+        table.add_column("Type", style="dim")
+        table.add_column("Status")
+        if verbose:
+            table.add_column("Description")
+
+        for vnote in lr.notes:
+            m = vnote.model
+            type_label = type(m).__name__.replace("Note", "")
+            desc = ""
+            if verbose:
+                raw_desc = getattr(m, "description", "") or ""
+                desc = raw_desc[:60] + ("..." if len(raw_desc) > 60 else "")
+            row = [m.id, type_label, m.status or "-"]
+            if verbose:
+                row.append(desc)
+            table.add_row(*row)
+
+        console.print(table)
+
+    # Summary
+    console.print(
+        f"\n[bold]{len(lr.notes)}[/bold] notes"
+        f" · [dim]{len(lr.skipped)} skipped · {len(lr.errors)} errors[/dim]"
+    )
+
+
+@vault_app.command("doctor")
+def vault_doctor(
+    vault: Optional[Path] = _vault_option,
+) -> None:
+    """Run data quality checks on the vault.
+
+    Checks for: broken links, empty descriptions, unscored notes,
+    untyped files, and parse errors.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    console.print(f"Checking [cyan]{vault_path}[/cyan] ...\n")
+    findings = check_vault_health(vault_path)
+
+    if not findings:
+        console.print("[bold green]✓ No issues found. Vault is clean.[/bold green]")
+        return
+
+    # Group by severity
+    errors = [f for f in findings if f.severity == "error"]
+    warnings = [f for f in findings if f.severity == "warning"]
+    infos = [f for f in findings if f.severity == "info"]
+
+    _ICONS = {"error": "[red]✗[/red]", "warning": "[yellow]![/yellow]", "info": "[dim]·[/dim]"}
+
+    for group, label in [(errors, "Errors"), (warnings, "Warnings"), (infos, "Info")]:
+        if not group:
+            continue
+        console.print(f"[bold]{label}[/bold] ({len(group)}):")
+        for f in group:
+            console.print(f"  {_ICONS[f.severity]} {f.file}: {f.message}")
+        console.print()
+
+    console.print(
+        f"[bold]Total:[/bold] "
+        f"[red]{len(errors)} errors[/red] · "
+        f"[yellow]{len(warnings)} warnings[/yellow] · "
+        f"[dim]{len(infos)} info[/dim]"
+    )
+
+
+@vault_app.command("write-test")
+def vault_write_test(
+    file: Path = typer.Argument(..., help="Note to read, write back, and verify"),
+) -> None:
+    """Round-trip test: read a note → write it back → read again → compare.
+
+    This proves that the read-write cycle doesn't lose or corrupt data.
+    The original file is backed up to .md.bak first.
+    """
+    import shutil
+
+    backup = file.with_suffix(".md.bak")
+
+    try:
+        # Step 1: read original
+        vnote1 = read_note(file)
+        console.print(f"[dim]Read:[/dim] {file.name} → {type(vnote1.model).__name__}")
+
+        # Step 2: backup original
+        shutil.copy2(file, backup)
+
+        # Step 3: write back (atomic)
+        write_note(vnote1)
+        console.print(f"[dim]Wrote:[/dim] {file.name} (atomic)")
+
+        # Step 4: read again
+        vnote2 = read_note(file)
+        console.print(f"[dim]Re-read:[/dim] {file.name} → {type(vnote2.model).__name__}")
+
+        # Step 5: compare models
+        d1 = vnote1.model.model_dump()
+        d2 = vnote2.model.model_dump()
+
+        diffs = []
+        all_keys = set(d1.keys()) | set(d2.keys())
+        for k in sorted(all_keys):
+            v1, v2 = d1.get(k), d2.get(k)
+            if v1 != v2:
+                diffs.append((k, v1, v2))
+
+        if not diffs:
+            console.print("[bold green]✓ Round-trip clean — no data loss.[/bold green]")
+        else:
+            console.print(f"[yellow]⚠ {len(diffs)} field(s) differ after round-trip:[/yellow]")
+            for k, v1, v2 in diffs:
+                console.print(f"  {k}: {v1!r} → {v2!r}")
+
+        # Restore backup
+        shutil.move(str(backup), str(file))
+        console.print(f"[dim]Original restored from backup.[/dim]")
+
+    except Exception as e:
+        # Restore on failure
+        if backup.exists():
+            shutil.move(str(backup), str(file))
+            console.print(f"[dim]Original restored from backup.[/dim]")
+        console.print(f"[red]✗ Error:[/red] {e}")
         raise typer.Exit(1)
 
 
