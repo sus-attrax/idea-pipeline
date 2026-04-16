@@ -1,0 +1,28 @@
+# Welche Datenquelle pro Feld pro Tier?
+# TODO Step 6-8: füllen wenn Research-Layer kommt.
+
+version: v1
+
+tiers:
+  T0:
+    description: "Vault only, no research"
+    sources: []
+  T1:
+    description: "Web search via Claude API"
+    sources: [claude_web_search]
+  T2:
+    description: "Structured public data sources"
+    sources: [claude_web_search, statista, destatis, eurostat]
+  T3:
+    description: "Deep dive: reports, competitors, expert sources"
+    sources: [claude_web_search, statista, destatis, eurostat, crunchbase, industry_reports]
+
+# Welche Felder werden überhaupt extern recherchiert?
+# (Andere Felder bleiben dein Input oder werden vom LLM aus Kontext abgeleitet.)
+external_fields:
+  chance:
+    - prevalence
+    - market_awareness
+  idee:
+    - market_size
+    - market_potential

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "idea-pipeline"
+version = "0.1.0"
+description = "Business idea validation & generation pipeline based on an Obsidian vault"
+requires-python = ">=3.11"
+dependencies = [
+    # LLM
+    "anthropic>=0.39.0",
+    # Vault I/O
+    "python-frontmatter>=1.1.0",
+    # Data validation & modeling
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    # Scoring & data manipulation
+    "pandas>=2.1.0",
+    # CLI
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+# Registers the `ideapipe` command system-wide once installed.
+# This is what you (and later: Claude via MCP) will call.
+ideapipe = "idea_pipeline.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/idea_pipeline"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
