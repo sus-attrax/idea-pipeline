@@ -22,7 +22,6 @@ from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
-from idea_pipeline.enrich import EnrichResult, run_enrich
 from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
 from idea_pipeline.schemas import (
     BaseNote,
@@ -495,99 +494,6 @@ def ingest_cmd(
         console.print(f"[red]Errors ({len(result.errors)}):[/red]")
         for fn, msg in result.errors:
             console.print(f"  [red]✗[/red] {fn}: {msg}")
-        raise typer.Exit(1)
-
-
-# --- Enrich command ----------------------------------------------------------
-
-@app.command("enrich")
-def enrich_cmd(
-    vault: Optional[Path] = _vault_option,
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without writing"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-    skip_umbrella: bool = typer.Option(False, "--skip-umbrella", help="Skip umbrella_problem phase"),
-) -> None:
-    """LLM-enrich the vault: generate chance descriptions, fill broken links, set hierarchy.
-
-    Four phases (all idempotent):
-
-    \b
-    1. Stubs       — create ChanceNote for every broken chance link in ideas
-    2. Generation  — for ideas with no chance links: LLM suggests 3-6 chances
-    3. Descriptions — batch-write 1-2 sentence descriptions for undescribed chances
-    4. Umbrella    — LLM suggests umbrella_problem hierarchy links
-
-    Uses claude-haiku for all calls. Sets research_fidelity=tier0 on written notes.
-    """
-    vault_path = get_vault_path(vault)
-    if not vault_path.is_dir():
-        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
-        raise typer.Exit(1)
-
-    if dry_run:
-        console.print("[bold yellow]Dry run[/bold yellow] — no files will be written.\n")
-
-    console.print(f"Enriching [cyan]{vault_path}[/cyan] ...\n")
-
-    try:
-        result = run_enrich(vault_path, dry_run=dry_run, verbose=verbose, skip_umbrella=skip_umbrella)
-    except Exception as e:
-        console.print(f"[red]✗ Enrich failed:[/red] {e}")
-        raise typer.Exit(1)
-
-    # Phase 1: stubs
-    if result.stubs_created:
-        console.print(f"[bold]Phase 1 — Stubs[/bold] ({len(result.stubs_created)} created):")
-        for cid in result.stubs_created:
-            prefix = "[dim]~[/dim]" if dry_run else "[green]+[/green]"
-            console.print(f"  {prefix} {cid}.md")
-
-    # Phase 2: new chance links
-    if result.chances_linked:
-        if dry_run:
-            console.print(f"\n[bold]Phase 2 — Links[/bold] ({len(result.chances_linked)} idea(s) without chances — would generate)")
-        else:
-            console.print(f"\n[bold]Phase 2 — Links[/bold] ({len(result.chances_linked)} ideas linked):")
-            for idea_id, links in result.chances_linked:
-                console.print(f"  [green]→[/green] {idea_id}: {', '.join(links)}")
-
-    # Phase 3: descriptions
-    if result.descriptions_written:
-        console.print(f"\n[bold]Phase 3 — Descriptions[/bold] ({len(result.descriptions_written)} written):")
-        for cid in result.descriptions_written:
-            prefix = "[dim]~[/dim]" if dry_run else "[green]✓[/green]"
-            console.print(f"  {prefix} {cid}")
-
-    # Phase 4: umbrella links
-    if result.umbrellas_written:
-        console.print(f"\n[bold]Phase 4 — Umbrella links[/bold] ({len(result.umbrellas_written)} written):")
-        for cid in result.umbrellas_written:
-            prefix = "[dim]~[/dim]" if dry_run else "[green]✓[/green]"
-            console.print(f"  {prefix} {cid}")
-
-    # Errors
-    if result.errors:
-        console.print(f"\n[red]Errors ({len(result.errors)}):[/red]")
-        for name, msg in result.errors:
-            console.print(f"  [red]✗[/red] {name}: {msg}")
-
-    # Summary
-    total = (
-        len(result.stubs_created)
-        + len(result.chances_linked)
-        + len(result.descriptions_written)
-        + len(result.umbrellas_written)
-    )
-    action = "Would affect" if dry_run else "Done."
-    console.print(
-        f"\n[bold]{action}[/bold] "
-        f"{len(result.stubs_created)} stubs · "
-        f"{len(result.descriptions_written)} descriptions · "
-        f"{len(result.umbrellas_written)} umbrella links · "
-        f"{len(result.errors)} errors"
-    )
-
-    if result.errors:
         raise typer.Exit(1)
 
 

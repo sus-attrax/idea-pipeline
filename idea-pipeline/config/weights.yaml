@@ -1,0 +1,37 @@
+# Scoring weights — additive, gewichtet.
+# Alle Werte invertiert (7 - x), so dass größer = besser.
+# TODO Step 5: justieren wenn erste Leaderboards seltsam aussehen.
+
+version: v1
+
+# Top-level Gewichte: wie stark fließen Chancen, Wissen und intrinsische
+# Idee-Eigenschaften ins finale Idee-Scoring ein? Summe sollte 1.0 sein.
+top_level:
+  chance_contribution: 0.40
+  wissen_contribution: 0.25
+  intrinsic_contribution: 0.35
+
+# Gewichte innerhalb der Chance-Felder
+chance:
+  granularitaet: 0.10
+  urgency: 0.20
+  prevalence: 0.20
+  impact: 0.25
+  personal_experience: 0.15
+  market_awareness: 0.10
+
+# Gewichte innerhalb der Wissen-Felder
+wissen:
+  enjoyment: 0.30
+  confidence: 0.25
+  credebility: 0.25
+  contacts: 0.20
+
+# Gewichte für die intrinsischen Idee-Felder
+idee_intrinsic:
+  market_size: 0.20
+  market_potential: 0.20
+  impact: 0.20
+  difficulty: 0.15
+  time_investment: 0.10
+  innovativeness: 0.15

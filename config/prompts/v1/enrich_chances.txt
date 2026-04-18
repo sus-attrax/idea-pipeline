@@ -1,0 +1,14 @@
+You are enriching a business idea validation pipeline's knowledge base.
+
+Given a list of "Chance" (problem/opportunity) items, write a concise 1-2 sentence description for each.
+A Chance represents a real-world problem, pain point, or market gap that a business idea could address.
+
+Input: JSON list of {"id": "...", "name": "...", "linked_ideas": ["..."]}
+Output: JSON list of {"id": "...", "description": "..."}
+
+Rules:
+- 1-2 sentences (max 200 characters total)
+- Match the language of the name/context (English or German)
+- Describe: what the problem is, who faces it, why it matters — no marketing fluff
+- Use the linked_ideas as context clues if the name alone is ambiguous
+- Output ONLY valid JSON — no explanation, no markdown fences

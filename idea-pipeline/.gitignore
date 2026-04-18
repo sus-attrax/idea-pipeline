@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# venv
+.venv/
+venv/
+
+# Cache & runs (data, not code)
+cache/*.db
+cache/*.db-journal
+runs/*.json
+runs/*.log
+
+# Secrets
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Keep empty dirs
+!cache/.gitkeep
+!runs/.gitkeep
+!config/prompts/v1/.gitkeep
+!src/idea_pipeline/research/sources/.gitkeep
