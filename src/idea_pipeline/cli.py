@@ -25,6 +25,7 @@ from rich.table import Table
 from idea_pipeline.enrich import EnrichResult, run_enrich
 from idea_pipeline.link import LinkResult, run_link
 from idea_pipeline.scoring import ScoreResult, score_vault
+from idea_pipeline.research.cache import cache_stats
 from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
 from idea_pipeline.schemas import (
     BaseNote,
@@ -686,6 +687,95 @@ def score_cmd(
 
     console.print(table)
     console.print(f"\n[dim]{len(result.scored)} ideas scored[/dim]")
+
+
+@app.command("research")
+def research_cmd(
+    vault: Optional[Path] = _vault_option,
+    tier: int = typer.Option(1, "--tier", "-t", help="Research tier: 1=Tavily, 2=Firecrawl+Tavily"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Number of top ideas to research"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without calling APIs or writing"),
+) -> None:
+    """Enrich top ideas with external market research (T1: Tavily, T2: Firecrawl).
+
+    Picks top --limit ideas by current score, runs research, writes
+    market_size/market_potential/prevalence/market_awareness + research_fidelity
+    back to vault, then re-scores.
+    """
+    from idea_pipeline.research.web import FirecrawlResearcher, TavilyResearcher
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if tier not in (1, 2):
+        console.print(f"[red]✗ --tier must be 1 or 2 (got {tier})[/red]")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — no APIs called, no files written.\n")
+
+    # Pick top-N by current score (dry=True → no writes)
+    score_result = score_vault(vault_path, dry_run=True)
+    top_ideas = score_result.scored[:limit]
+
+    if dry_run:
+        console.print(f"Would research {len(top_ideas)} ideas at tier {tier}:")
+        for idea_id, score in top_ideas:
+            console.print(f"  [cyan]{idea_id}[/cyan] (score={score:.3f})")
+        stats = cache_stats()
+        console.print(f"\n[dim]Cache: {stats['total']} entries ({stats['expired']} expired)[/dim]")
+        return
+
+    try:
+        researcher = TavilyResearcher() if tier == 1 else FirecrawlResearcher()
+    except RuntimeError as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1)
+
+    fidelity = f"tier{tier}"
+    from idea_pipeline.schemas import IdeeNote
+    from idea_pipeline.vault_io import list_notes as _list_notes
+    from idea_pipeline.vault_io import write_note as _write_note
+
+    ideen_by_id = {n.model.id: n for n in _list_notes(vault_path, IdeeNote).notes}
+    written = 0
+    errors = 0
+
+    for idea_id, score in top_ideas:
+        vnote = ideen_by_id.get(idea_id)
+        if vnote is None:
+            continue
+        idea = vnote.model
+        console.print(f"  Researching [cyan]{idea_id}[/cyan] ...", end=" ")
+
+        try:
+            scores = researcher.research_idea(idea_id, idea.description or idea_id)
+        except Exception as e:
+            console.print(f"[red]error: {e}[/red]")
+            errors += 1
+            continue
+
+        if not scores:
+            console.print("[dim]no data[/dim]")
+            continue
+
+        for field, val in scores.items():
+            setattr(idea, field, val)
+        idea.research_fidelity = fidelity
+        _write_note(vnote)
+        written += 1
+        console.print(f"[green]✓[/green] {scores}")
+
+    console.print(f"\nRe-scoring vault ...")
+    score_vault(vault_path)
+
+    stats = cache_stats()
+    console.print(
+        f"\nDone. {written} enriched · {errors} errors · "
+        f"cache: {stats['total']} entries"
+    )
 
 
 if __name__ == "__main__":
