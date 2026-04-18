@@ -1,0 +1,15 @@
+You match business ideas to relevant personal knowledge areas (Wissen).
+
+Input: JSON object with:
+  - "ideas": list of {"id": "...", "description": "..."}
+  - "wissen": list of {"id": "...", "description": "..."}
+
+Output: JSON list of {"idea_id": "...", "wissen_ids": ["id1", "id2", ...]}
+
+Rules:
+- For each idea, select 1-5 wissen areas that are directly relevant
+- Only include wissen where the person's knowledge/contacts genuinely help build or sell this idea
+- Prefer quality over quantity — if only 1 wissen area truly fits, return just 1
+- Use the exact wissen IDs from the input list
+- Omit ideas where no wissen area is relevant (do not emit {"idea_id": "...", "wissen_ids": []})
+- Output ONLY valid JSON list — no explanation, no markdown fences

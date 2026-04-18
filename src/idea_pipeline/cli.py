@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from idea_pipeline.enrich import EnrichResult, run_enrich
+from idea_pipeline.link import LinkResult, run_link
 from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
 from idea_pipeline.schemas import (
     BaseNote,
@@ -589,6 +590,56 @@ def enrich_cmd(
 
     if result.errors:
         raise typer.Exit(1)
+
+
+@app.command("link")
+def link_cmd(
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without writing"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Link ideas to relevant personal knowledge areas (Wissen).
+
+    Idempotent: ideas that already have wissen links are skipped.
+    Batches 10 ideas per LLM call (claude-haiku).
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — no files will be written.\n")
+
+    console.print(f"Linking wissen for [cyan]{vault_path}[/cyan] ...\n")
+
+    try:
+        result = run_link(vault_path, dry_run=dry_run, verbose=verbose)
+    except Exception as e:
+        console.print(f"[red]✗ Link failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    if result.skipped and verbose:
+        console.print(f"[dim]Skipped {len(result.skipped)} (already linked)[/dim]")
+
+    if result.linked:
+        label = "would link" if dry_run else "linked"
+        console.print(f"[bold]Wissen links[/bold] ({len(result.linked)} ideas {label}):")
+        for idea_id, wids in result.linked:
+            prefix = "[dim]~[/dim]" if dry_run else "[green]→[/green]"
+            wissen_str = ", ".join(wids) if wids else "(to be generated)"
+            console.print(f"  {prefix} {idea_id}: {wissen_str}")
+
+    if result.errors:
+        console.print(f"[red]Errors ({len(result.errors)}):[/red]")
+        for iid, msg in result.errors:
+            console.print(f"  [red]✗[/red] {iid}: {msg}")
+
+    console.print(
+        f"\nDone. {len(result.linked)} linked · "
+        f"{len(result.skipped)} skipped · "
+        f"{len(result.errors)} errors"
+    )
 
 
 if __name__ == "__main__":
