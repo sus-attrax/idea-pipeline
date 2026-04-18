@@ -24,6 +24,7 @@ from rich.table import Table
 
 from idea_pipeline.enrich import EnrichResult, run_enrich
 from idea_pipeline.link import LinkResult, run_link
+from idea_pipeline.scoring import ScoreResult, score_vault
 from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
 from idea_pipeline.schemas import (
     BaseNote,
@@ -640,6 +641,51 @@ def link_cmd(
         f"{len(result.skipped)} skipped · "
         f"{len(result.errors)} errors"
     )
+
+
+@app.command("score")
+def score_cmd(
+    vault: Optional[Path] = _vault_option,
+    tier: int = typer.Option(0, "--tier", "-t", help="Research tier (0=vault only)"),
+    top: Optional[int] = typer.Option(None, "--top", "-n", help="Show only top N ideas"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Compute scores without writing to vault"),
+) -> None:
+    """Score all ideas and print a leaderboard (T0: vault-only, no research).
+
+    Writes score, score_breakdown, score_version, scored_at into each idea note.
+    Idempotent — safe to re-run after adding new chances or wissen links.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if tier != 0:
+        console.print(f"[red]✗ Only --tier 0 is implemented (got {tier})[/red]")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — scores computed but not written.\n")
+
+    console.print(f"Scoring [cyan]{vault_path}[/cyan] (T0) ...\n")
+
+    try:
+        result = score_vault(vault_path, dry_run=dry_run, top_n=top)
+    except Exception as e:
+        console.print(f"[red]✗ Scoring failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    from rich.table import Table
+    table = Table(title=f"Leaderboard — T0{'  (dry run)' if dry_run else ''}", show_lines=False)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Idea", style="cyan", no_wrap=False, max_width=55)
+    table.add_column("Score", justify="right", style="bold green")
+
+    for rank, (idea_id, score) in enumerate(result.scored, 1):
+        table.add_row(str(rank), idea_id, f"{score:.3f}")
+
+    console.print(table)
+    console.print(f"\n[dim]{len(result.scored)} ideas scored[/dim]")
 
 
 if __name__ == "__main__":
