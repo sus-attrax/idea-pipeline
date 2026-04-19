@@ -1,8 +1,8 @@
 """Web research adapters: Tavily (T1) and Firecrawl (T2).
 
 TavilyResearcher   — 4 Tavily searches per idea, Haiku extracts 1-6 scores.
-FirecrawlResearcher — finds Destatis/Eurostat via Tavily, scrapes with Firecrawl,
-                      Sonnet extracts scores from markdown.
+FirecrawlResearcher — uses Firecrawl search to discover market research pages,
+                      scrapes top 2 results, Sonnet extracts 1-6 scores + narrative.
 Both use the research cache to avoid redundant API calls.
 """
 
@@ -35,6 +35,13 @@ _QUERY_TEMPLATES = {
 }
 
 _STAT_DOMAINS = ["destatis.de", "eurostat.ec.europa.eu", "statista.com"]
+
+_FC_SEARCH_QUERIES = [
+    "{description} global market size revenue statistics",
+    "{description} market growth rate forecast CAGR",
+]
+
+_MIN_CREDITS = 20  # stop T2 if remaining credits drop below this
 
 
 def _get_anthropic():
@@ -121,51 +128,70 @@ class TavilyResearcher:
 # ---------------------------------------------------------------------------
 
 class FirecrawlResearcher:
-    SOURCE = "firecrawl_v1"
-    TAVILY_SOURCE = "tavily_t2_url_discovery"
+    SOURCE = "firecrawl_v2"
+    FC_SEARCH_SOURCE = "firecrawl_v2_search"
 
     def __init__(self):
         from firecrawl import FirecrawlApp
-        from tavily import TavilyClient
 
         fc_key = os.environ.get("FIRECRAWL_API_KEY", "")
-        tv_key = os.environ.get("TAVILY_API_KEY", "")
         if not fc_key or fc_key.startswith("fc-..."):
             raise RuntimeError("FIRECRAWL_API_KEY not set in .env")
-        if not tv_key or tv_key.startswith("tvly-..."):
-            raise RuntimeError("TAVILY_API_KEY not set in .env")
 
         self._fc = FirecrawlApp(api_key=fc_key)
-        self._tv = TavilyClient(api_key=tv_key)
         self._llm = _get_anthropic()
-        self._prompt = _read_prompt("research_t2_extract.txt")
+        self._prompt = _read_prompt("research_t2_extract_v2.txt")
 
-    def research_idea(self, idea_id: str, description: str) -> dict[str, Optional[int]]:
-        """Return {field: score_or_None} — only fields with evidence are scored."""
-        url = self._find_stat_url(description)
-        if url is None:
-            return {}
-        markdown = self._scrape(url)
-        if not markdown:
-            return {}
-        return self._extract_scores(description, markdown, url)
+    def remaining_credits(self) -> int:
+        try:
+            return self._fc.get_credit_usage().remaining_credits or 0
+        except Exception:
+            return 9999
 
-    def _find_stat_url(self, description: str) -> Optional[str]:
-        query = f"{description[:200]} statistics site:destatis.de OR site:eurostat.ec.europa.eu"
-        cached = cache_get(query, self.TAVILY_SOURCE)
+    def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, Optional[int]], str]:
+        """Return (scores_dict, narrative_text). scores may be partial or empty."""
+        urls_with_snippets = self._search_urls(description)
+        if not urls_with_snippets:
+            return {}, ""
+
+        # Scrape top 2 URLs, collect markdown
+        sections: list[str] = []
+        scraped_urls: list[str] = []
+        for url, snippet in urls_with_snippets[:2]:
+            md = self._scrape(url)
+            if md:
+                sections.append(f"### {url}\n\n{md[:5000]}")
+                scraped_urls.append(url)
+            elif snippet:
+                sections.append(f"### {url}\n\n{snippet}")
+                scraped_urls.append(url)
+
+        if not sections:
+            return {}, ""
+
+        combined_md = "\n\n---\n\n".join(sections)
+        return self._extract(description, combined_md, scraped_urls)
+
+    def _search_urls(self, description: str) -> list[tuple[str, str]]:
+        """Return [(url, snippet), ...] from Firecrawl search, cached."""
+        query = _FC_SEARCH_QUERIES[0].format(description=description[:180])
+        cached = cache_get(query, self.FC_SEARCH_SOURCE)
         if cached:
-            return cached.get("url")
+            return [(r["url"], r.get("description", "")) for r in cached.get("results", [])]
 
         try:
-            results = self._tv.search(query=query, search_depth="basic", max_results=3)
-            urls = [r.get("url", "") for r in results.get("results", []) if r.get("url")]
-            stat_urls = [u for u in urls if any(d in u for d in _STAT_DOMAINS)]
-            url = stat_urls[0] if stat_urls else (urls[0] if urls else None)
+            result = self._fc.search(query, limit=5)
+            items = result.web or []
+            results = [
+                {"url": item.url, "description": item.description or ""}
+                for item in items
+                if getattr(item, "url", None)
+            ]
         except Exception:
-            url = None
+            results = []
 
-        cache_set(query, self.TAVILY_SOURCE, {"url": url})
-        return url
+        cache_set(query, self.FC_SEARCH_SOURCE, {"results": results})
+        return [(r["url"], r["description"]) for r in results]
 
     def _scrape(self, url: str) -> Optional[str]:
         cached = cache_get(url, self.SOURCE)
@@ -173,34 +199,37 @@ class FirecrawlResearcher:
             return cached.get("markdown")
 
         try:
-            result = self._fc.scrape_url(url, formats=["markdown"])
-            markdown = result.get("markdown", "") if isinstance(result, dict) else ""
-            markdown = markdown[:8000]
+            result = self._fc.scrape(url, formats=["markdown"])
+            markdown = (result.markdown or "")[:8000] if hasattr(result, "markdown") else ""
         except Exception:
             markdown = None
 
         cache_set(url, self.SOURCE, {"markdown": markdown})
-        return markdown
+        return markdown or None
 
-    def _extract_scores(self, description: str, markdown: str, url: str) -> dict[str, Optional[int]]:
+    def _extract(
+        self, description: str, combined_md: str, sources: list[str]
+    ) -> tuple[dict[str, Optional[int]], str]:
         payload = {
-            "idea_description": description[:300],
-            "scraped_markdown": markdown,
-            "source_url": url,
+            "idea_description": description[:400],
+            "combined_markdown": combined_md,
+            "source_urls": sources,
         }
         try:
             resp = self._llm.messages.create(
                 model=_SONNET,
-                max_tokens=512,
+                max_tokens=1024,
                 system=self._prompt,
                 messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             )
             data = _parse_json(resp.content[0].text)
         except Exception:
-            return {}
+            return {}, ""
 
-        return {
+        scores = {
             field: max(1, min(6, int(data[field])))
             for field in _RESEARCH_FIELDS
             if data.get(field) is not None
         }
+        narrative = data.get("narrative", "")
+        return scores, narrative
