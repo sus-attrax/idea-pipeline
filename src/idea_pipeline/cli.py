@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.table import Table
 
 from idea_pipeline.enrich import EnrichResult, run_enrich
+from idea_pipeline.enrich_intrinsic import EnrichIntrinsicResult, run_intrinsic_enrich
 from idea_pipeline.link import LinkResult, run_link
 from idea_pipeline.scoring import ScoreResult, score_vault
 from idea_pipeline.research.cache import cache_stats
@@ -1021,6 +1022,57 @@ def report_cmd(
     out.write_text("\n".join(lines), encoding="utf-8")
     console.print(f"[green]✓[/green] {out}  ({len(ideas)} ideas)")
     console.print(f"[dim]Commit with: git add {out.name} && git commit -m 'leaderboard: {today}'[/dim]")
+
+
+@app.command("enrich-intrinsic")
+def enrich_intrinsic_cmd(
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without API calls"),
+    force: bool = typer.Option(False, "--force", help="Re-enrich already-enriched ideas"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Process only N ideas"),
+) -> None:
+    """Step 10: LLM batch rebuild of attractiveness, fit, and gates for all ideas.
+
+    Idempotent: skips ideas already enriched (attractiveness_impact != 6), unless --force.
+    Costs ~$5 for all 142 ideas (Sonnet 4.6, batch size 5).
+    """
+    import math
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    from idea_pipeline.vault_io import list_notes
+    from idea_pipeline.schemas import IdeeNote
+
+    all_ideen = list_notes(vault_path, IdeeNote).notes
+    to_enrich = [n for n in all_ideen if n.model.attractiveness_impact == 6 or force]
+    effective = min(len(to_enrich), limit or len(to_enrich))
+
+    estimated_cost = (math.ceil(effective / 5)) * 0.15
+    console.print(f"[bold]enrich-intrinsic[/bold]  {effective} ideas · ~${estimated_cost:.2f} estimated")
+
+    if not dry_run and estimated_cost > 1.0:
+        confirm = typer.confirm(f"Run LLM enrichment for {effective} ideas (~${estimated_cost:.2f})?")
+        if not confirm:
+            console.print("Aborted.")
+            raise typer.Exit(0)
+
+    result = run_intrinsic_enrich(
+        vault_path,
+        dry_run=dry_run,
+        force=force,
+        limit=limit,
+    )
+    console.print(
+        f"\n[green]✓[/green] enriched={len(result.enriched)} "
+        f"skipped={len(result.skipped)} "
+        f"errors={len(result.errors)}"
+    )
+    if result.errors:
+        for idea_id, msg in result.errors:
+            console.print(f"  [red]✗[/red] {idea_id}: {msg}")
 
 
 if __name__ == "__main__":
