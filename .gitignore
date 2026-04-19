@@ -33,3 +33,4 @@ runs/*.log
 !runs/.gitkeep
 !config/prompts/v1/.gitkeep
 !src/idea_pipeline/research/sources/.gitkeep
+.worktrees/
