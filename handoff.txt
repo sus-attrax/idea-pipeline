@@ -1,0 +1,3762 @@
+src/idea_pipeline/__init__.py
+---
+"""Business idea validation & generation pipeline."""
+
+__version__ = "0.1.0"
+
+
+---
+src/idea_pipeline/cli.py
+---
+"""CLI entry point for the idea pipeline.
+
+Commands grow with each pipeline step:
+  Step 1: hello, info
+  Step 2: schema check, schema check-dir
+  Step 3: vault read, vault list, vault doctor
+  Step 5: ingest (create notes from name:description pairs)
+
+Each command is an isolated, idempotent step — the contract between
+you (and later, Claude Code) and the system.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Optional
+
+import frontmatter
+import typer
+from pydantic import ValidationError
+from rich.console import Console
+from rich.table import Table
+
+from idea_pipeline.enrich import EnrichResult, run_enrich
+from idea_pipeline.link import LinkResult, run_link
+from idea_pipeline.scoring import ScoreResult, score_vault
+from idea_pipeline.research.cache import cache_stats
+from idea_pipeline.ingest import IngestResult, ingest, parse_ingest_input
+from idea_pipeline.schemas import (
+    BaseNote,
+    ChanceNote,
+    IdeeNote,
+    WissenNote,
+    detect_note_type,
+)
+from idea_pipeline.settings import get_vault_path
+from idea_pipeline.vault_io import (
+    DoctorFinding,
+    ListResult,
+    VaultNote,
+    check_vault_health,
+    list_notes,
+    read_note,
+    write_note,
+)
+
+app = typer.Typer(
+    name="ideapipe",
+    help="Business idea validation & generation pipeline.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+console = Console()
+
+# --- Top-level commands ------------------------------------------------------
+
+@app.command()
+def hello(name: str = "Meister") -> None:
+    """Smoke test."""
+    console.print(f"[bold green]✓[/bold green] Pipeline lebt. Hallo, {name}.")
+
+
+@app.command()
+def info() -> None:
+    """Show pipeline status and configured paths."""
+    from idea_pipeline import __version__
+
+    vault = get_vault_path()
+    console.print(f"[bold]idea-pipeline[/bold] v{__version__}")
+    console.print(f"Vault path: [cyan]{vault}[/cyan]")
+    if vault.is_dir():
+        md_count = len(list(vault.glob("*.md")))
+        console.print(f"Notes found: {md_count}")
+    else:
+        console.print("[yellow]Vault directory does not exist yet.[/yellow]")
+
+
+# --- Schema commands ---------------------------------------------------------
+
+schema_app = typer.Typer(help="Schema validation utilities.", no_args_is_help=True)
+app.add_typer(schema_app, name="schema")
+
+
+def _validate_one(file: Path) -> tuple[str, object | None, str | None]:
+    """Validate one note. Returns (status, model_or_None, error_msg_or_None)."""
+    try:
+        post = frontmatter.load(file)
+    except Exception as e:
+        return ("invalid", None, f"frontmatter parse failed: {e}")
+    schema_cls = detect_note_type(post.metadata)
+    if schema_cls is None:
+        return ("unknown_type", None, None)
+    try:
+        data = dict(post.metadata)
+        data["id"] = file.stem
+        note = schema_cls.model_validate(data)
+        return ("valid", note, None)
+    except ValidationError as e:
+        first_err = e.errors()[0]
+        loc = ".".join(str(p) for p in first_err["loc"])
+        return ("invalid", None, f"{loc}: {first_err['msg']}")
+
+
+@schema_app.command("check")
+def schema_check(
+    file: Path = typer.Argument(..., help="Path to a markdown note file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Validate a single note against its detected schema."""
+    if not file.exists():
+        console.print(f"[red]✗ File not found:[/red] {file}")
+        raise typer.Exit(1)
+
+    status, note, err = _validate_one(file)
+    if status == "unknown_type":
+        console.print(f"[yellow]?[/yellow] {file.name}: no recognized database field")
+        raise typer.Exit(2)
+    if status == "invalid":
+        console.print(f"[red]✗[/red] {file.name}: {err}")
+        raise typer.Exit(1)
+
+    cls_name = type(note).__name__
+    console.print(f"[bold green]✓[/bold green] {file.name} → [bold]{cls_name}[/bold]")
+
+    if verbose:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Field", style="dim")
+        table.add_column("Value")
+        for fn, fv in note.model_dump().items():
+            if fv is None or fv == [] or fv == "":
+                continue
+            val_str = str(fv)
+            if len(val_str) > 100:
+                val_str = val_str[:97] + "..."
+            table.add_row(fn, val_str)
+        console.print(table)
+
+
+@schema_app.command("check-dir")
+def schema_check_dir(
+    directory: Path = typer.Argument(..., help="Directory of markdown notes"),
+    show_unknown: bool = typer.Option(False, "--show-unknown"),
+) -> None:
+    """Batch-validate all .md notes in a directory."""
+    if not directory.is_dir():
+        console.print(f"[red]✗ Not a directory:[/red] {directory}")
+        raise typer.Exit(1)
+
+    files = sorted(directory.glob("*.md"))
+    if not files:
+        console.print(f"[yellow]No .md files found in {directory}[/yellow]")
+        raise typer.Exit(0)
+
+    valid, invalid_list, unknown_list = 0, [], []
+    counts: dict[str, int] = {}
+
+    for f in files:
+        status, note, err = _validate_one(f)
+        if status == "valid":
+            valid += 1
+            cn = type(note).__name__
+            counts[cn] = counts.get(cn, 0) + 1
+        elif status == "invalid":
+            invalid_list.append((f.name, err or "unknown"))
+        else:
+            unknown_list.append(f.name)
+
+    console.print(
+        f"\n[bold]Summary[/bold] ({len(files)} files): "
+        f"[green]{valid} valid[/green] · "
+        f"[red]{len(invalid_list)} invalid[/red] · "
+        f"[dim]{len(unknown_list)} unknown[/dim]"
+    )
+    if counts:
+        console.print(f"[dim]{' · '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}[/dim]")
+    if invalid_list:
+        console.print("\n[bold red]Invalid:[/bold red]")
+        for fn, msg in invalid_list:
+            console.print(f"  [red]✗[/red] {fn}: {msg}")
+    if show_unknown and unknown_list:
+        console.print("\n[bold yellow]Unknown type:[/bold yellow]")
+        for fn in unknown_list:
+            console.print(f"  [yellow]?[/yellow] {fn}")
+    if invalid_list:
+        raise typer.Exit(1)
+
+
+# --- Vault commands ----------------------------------------------------------
+
+vault_app = typer.Typer(help="Read, list, and inspect vault notes.", no_args_is_help=True)
+app.add_typer(vault_app, name="vault")
+
+# Reusable vault path option
+_vault_option = typer.Option(
+    None, "--vault", "-V",
+    help="Vault directory (default: $IDEAPIPE_VAULT or ~/vaults/idea-validation)",
+)
+
+_TYPE_MAP = {"idee": IdeeNote, "chance": ChanceNote, "wissen": WissenNote}
+
+
+@vault_app.command("read")
+def vault_read(
+    file: Path = typer.Argument(..., help="Path to a note file"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Read a single note and display its parsed data."""
+    try:
+        vnote = read_note(file)
+    except (FileNotFoundError, ValueError, ValidationError) as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+    model = vnote.model
+    cls_name = type(model).__name__
+    console.print(f"[bold green]✓[/bold green] {file.name} → [bold]{cls_name}[/bold] (id: {model.id})")
+
+    if vnote.body:
+        body_preview = vnote.body[:80].replace("\n", " ")
+        if len(vnote.body) > 80:
+            body_preview += "..."
+        console.print(f"[dim]Body: {body_preview}[/dim]")
+
+    if verbose:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Field", style="dim")
+        table.add_column("Value")
+        for fn, fv in model.model_dump().items():
+            if fv is None or fv == [] or fv == "":
+                continue
+            val_str = str(fv)
+            if len(val_str) > 120:
+                val_str = val_str[:117] + "..."
+            table.add_row(fn, val_str)
+        console.print(table)
+
+
+@vault_app.command("list")
+def vault_list(
+    vault: Optional[Path] = _vault_option,
+    note_type: Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="Filter by type: idee, chance, wissen",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """List all notes in the vault, optionally filtered by type."""
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    type_cls = None
+    if note_type:
+        type_cls = _TYPE_MAP.get(note_type.lower())
+        if type_cls is None:
+            console.print(f"[red]✗ Unknown type:[/red] {note_type}. Use: idee, chance, wissen")
+            raise typer.Exit(1)
+
+    lr = list_notes(vault_path, note_type=type_cls)
+
+    # Print notes
+    if not lr.notes:
+        console.print("[yellow]No matching notes found.[/yellow]")
+    else:
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("ID", style="bold")
+        table.add_column("Type", style="dim")
+        table.add_column("Status")
+        if verbose:
+            table.add_column("Description")
+
+        for vnote in lr.notes:
+            m = vnote.model
+            type_label = type(m).__name__.replace("Note", "")
+            desc = ""
+            if verbose:
+                raw_desc = getattr(m, "description", "") or ""
+                desc = raw_desc[:60] + ("..." if len(raw_desc) > 60 else "")
+            row = [m.id, type_label, m.status or "-"]
+            if verbose:
+                row.append(desc)
+            table.add_row(*row)
+
+        console.print(table)
+
+    # Summary
+    console.print(
+        f"\n[bold]{len(lr.notes)}[/bold] notes"
+        f" · [dim]{len(lr.skipped)} skipped · {len(lr.errors)} errors[/dim]"
+    )
+
+
+@vault_app.command("doctor")
+def vault_doctor(
+    vault: Optional[Path] = _vault_option,
+) -> None:
+    """Run data quality checks on the vault.
+
+    Checks for: broken links, empty descriptions, unscored notes,
+    untyped files, and parse errors.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    console.print(f"Checking [cyan]{vault_path}[/cyan] ...\n")
+    findings = check_vault_health(vault_path)
+
+    if not findings:
+        console.print("[bold green]✓ No issues found. Vault is clean.[/bold green]")
+        return
+
+    # Group by severity
+    errors = [f for f in findings if f.severity == "error"]
+    warnings = [f for f in findings if f.severity == "warning"]
+    infos = [f for f in findings if f.severity == "info"]
+
+    _ICONS = {"error": "[red]✗[/red]", "warning": "[yellow]![/yellow]", "info": "[dim]·[/dim]"}
+
+    for group, label in [(errors, "Errors"), (warnings, "Warnings"), (infos, "Info")]:
+        if not group:
+            continue
+        console.print(f"[bold]{label}[/bold] ({len(group)}):")
+        for f in group:
+            console.print(f"  {_ICONS[f.severity]} {f.file}: {f.message}")
+        console.print()
+
+    console.print(
+        f"[bold]Total:[/bold] "
+        f"[red]{len(errors)} errors[/red] · "
+        f"[yellow]{len(warnings)} warnings[/yellow] · "
+        f"[dim]{len(infos)} info[/dim]"
+    )
+
+
+@vault_app.command("write-test")
+def vault_write_test(
+    file: Path = typer.Argument(..., help="Note to read, write back, and verify"),
+) -> None:
+    """Round-trip test: read a note → write it back → read again → compare.
+
+    This proves that the read-write cycle doesn't lose or corrupt data.
+    The original file is backed up to .md.bak first.
+    """
+    import shutil
+
+    backup = file.with_suffix(".md.bak")
+
+    try:
+        # Step 1: read original
+        vnote1 = read_note(file)
+        console.print(f"[dim]Read:[/dim] {file.name} → {type(vnote1.model).__name__}")
+
+        # Step 2: backup original
+        shutil.copy2(file, backup)
+
+        # Step 3: write back (atomic)
+        write_note(vnote1)
+        console.print(f"[dim]Wrote:[/dim] {file.name} (atomic)")
+
+        # Step 4: read again
+        vnote2 = read_note(file)
+        console.print(f"[dim]Re-read:[/dim] {file.name} → {type(vnote2.model).__name__}")
+
+        # Step 5: compare models
+        d1 = vnote1.model.model_dump()
+        d2 = vnote2.model.model_dump()
+
+        diffs = []
+        all_keys = set(d1.keys()) | set(d2.keys())
+        for k in sorted(all_keys):
+            v1, v2 = d1.get(k), d2.get(k)
+            if v1 != v2:
+                diffs.append((k, v1, v2))
+
+        if not diffs:
+            console.print("[bold green]✓ Round-trip clean — no data loss.[/bold green]")
+        else:
+            console.print(f"[yellow]⚠ {len(diffs)} field(s) differ after round-trip:[/yellow]")
+            for k, v1, v2 in diffs:
+                console.print(f"  {k}: {v1!r} → {v2!r}")
+
+        # Restore backup
+        shutil.move(str(backup), str(file))
+        console.print(f"[dim]Original restored from backup.[/dim]")
+
+    except Exception as e:
+        # Restore on failure
+        if backup.exists():
+            shutil.move(str(backup), str(file))
+            console.print(f"[dim]Original restored from backup.[/dim]")
+        console.print(f"[red]✗ Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# --- Ingest commands ---------------------------------------------------------
+
+@app.command("ingest")
+def ingest_cmd(
+    text: Optional[str] = typer.Argument(
+        None,
+        help='Inline "name: description" (one idea). For multiple, use --file or --stdin.',
+    ),
+    file: Optional[Path] = typer.Option(
+        None, "--file", "-f",
+        help="File with one 'name: description' per line",
+    ),
+    stdin: bool = typer.Option(
+        False, "--stdin",
+        help="Read from stdin (for piping)",
+    ),
+    note_type: str = typer.Option(
+        "idee", "--type", "-t",
+        help="Note type to create: idee, chance, wissen",
+    ),
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", "-n",
+        help="Preview what would be created without writing files",
+    ),
+) -> None:
+    """Create vault notes from name:description pairs.
+
+    Three ways to provide input:
+
+      # Single idea inline
+      ideapipe ingest "urban_mushroom_farm: growing gourmet mushrooms in urban basements"
+
+      # Multiple from a file (one per line)
+      ideapipe ingest --file ideas.txt
+
+      # Piped from another command or Claude Code
+      echo "idea1: desc1" | ideapipe ingest --stdin
+
+    File format (one per line):
+      name: description text here
+      another_name: another description
+      # lines starting with # are comments
+
+    Idempotent: existing files are skipped, never overwritten.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    # Resolve input source
+    if file:
+        if not file.exists():
+            console.print(f"[red]✗ File not found:[/red] {file}")
+            raise typer.Exit(1)
+        input_text = file.read_text(encoding="utf-8")
+    elif stdin:
+        input_text = sys.stdin.read()
+    elif text:
+        input_text = text
+    else:
+        console.print(
+            "[red]✗ No input.[/red] Provide inline text, --file, or --stdin.\n"
+            "[dim]Example: ideapipe ingest \"my_idea: a great business idea\"[/dim]"
+        )
+        raise typer.Exit(1)
+
+    # Preview
+    items = parse_ingest_input(input_text)
+    if not items:
+        console.print("[yellow]No items parsed from input.[/yellow]")
+        raise typer.Exit(0)
+
+    if dry_run:
+        console.print(f"[bold]Dry run[/bold] — would create {len(items)} {note_type} note(s):\n")
+        for item in items:
+            target = vault_path / f"{item.filename}.md"
+            exists = target.exists()
+            status = "[dim]SKIP (exists)[/dim]" if exists else "[green]CREATE[/green]"
+            desc_preview = (item.description[:50] + "...") if len(item.description) > 50 else item.description
+            console.print(f"  {status} {item.filename}.md — {desc_preview or '[no description]'}")
+        return
+
+    # Execute
+    result = ingest(input_text, vault_path, note_type=note_type)
+
+    # Report
+    if result.created:
+        console.print(f"[bold green]✓ Created {len(result.created)} note(s):[/bold green]")
+        for fn in result.created:
+            console.print(f"  [green]+[/green] {fn}.md")
+
+    if result.skipped:
+        console.print(f"[dim]Skipped {len(result.skipped)} (already exist):[/dim]")
+        for fn in result.skipped:
+            console.print(f"  [dim]–[/dim] {fn}.md")
+
+    if result.errors:
+        console.print(f"[red]Errors ({len(result.errors)}):[/red]")
+        for fn, msg in result.errors:
+            console.print(f"  [red]✗[/red] {fn}: {msg}")
+        raise typer.Exit(1)
+
+
+# --- Enrich command ----------------------------------------------------------
+
+@app.command("enrich")
+def enrich_cmd(
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without writing"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    skip_umbrella: bool = typer.Option(False, "--skip-umbrella", help="Skip umbrella_problem phase"),
+) -> None:
+    """LLM-enrich the vault: generate chance descriptions, fill broken links, set hierarchy.
+
+    Four phases (all idempotent):
+
+    \b
+    1. Stubs       — create ChanceNote for every broken chance link in ideas
+    2. Generation  — for ideas with no chance links: LLM suggests 3-6 chances
+    3. Descriptions — batch-write 1-2 sentence descriptions for undescribed chances
+    4. Umbrella    — LLM suggests umbrella_problem hierarchy links
+
+    Uses claude-haiku for all calls. Sets research_fidelity=tier0 on written notes.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — no files will be written.\n")
+
+    console.print(f"Enriching [cyan]{vault_path}[/cyan] ...\n")
+
+    try:
+        result = run_enrich(vault_path, dry_run=dry_run, verbose=verbose, skip_umbrella=skip_umbrella)
+    except Exception as e:
+        console.print(f"[red]✗ Enrich failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    # Phase 1: stubs
+    if result.stubs_created:
+        console.print(f"[bold]Phase 1 — Stubs[/bold] ({len(result.stubs_created)} created):")
+        for cid in result.stubs_created:
+            prefix = "[dim]~[/dim]" if dry_run else "[green]+[/green]"
+            console.print(f"  {prefix} {cid}.md")
+
+    # Phase 2: new chance links
+    if result.chances_linked:
+        if dry_run:
+            console.print(f"\n[bold]Phase 2 — Links[/bold] ({len(result.chances_linked)} idea(s) without chances — would generate)")
+        else:
+            console.print(f"\n[bold]Phase 2 — Links[/bold] ({len(result.chances_linked)} ideas linked):")
+            for idea_id, links in result.chances_linked:
+                console.print(f"  [green]→[/green] {idea_id}: {', '.join(links)}")
+
+    # Phase 3: descriptions
+    if result.descriptions_written:
+        console.print(f"\n[bold]Phase 3 — Descriptions[/bold] ({len(result.descriptions_written)} written):")
+        for cid in result.descriptions_written:
+            prefix = "[dim]~[/dim]" if dry_run else "[green]✓[/green]"
+            console.print(f"  {prefix} {cid}")
+
+    # Phase 4: umbrella links
+    if result.umbrellas_written:
+        console.print(f"\n[bold]Phase 4 — Umbrella links[/bold] ({len(result.umbrellas_written)} written):")
+        for cid in result.umbrellas_written:
+            prefix = "[dim]~[/dim]" if dry_run else "[green]✓[/green]"
+            console.print(f"  {prefix} {cid}")
+
+    # Errors
+    if result.errors:
+        console.print(f"\n[red]Errors ({len(result.errors)}):[/red]")
+        for name, msg in result.errors:
+            console.print(f"  [red]✗[/red] {name}: {msg}")
+
+    # Summary
+    total = (
+        len(result.stubs_created)
+        + len(result.chances_linked)
+        + len(result.descriptions_written)
+        + len(result.umbrellas_written)
+    )
+    action = "Would affect" if dry_run else "Done."
+    console.print(
+        f"\n[bold]{action}[/bold] "
+        f"{len(result.stubs_created)} stubs · "
+        f"{len(result.descriptions_written)} descriptions · "
+        f"{len(result.umbrellas_written)} umbrella links · "
+        f"{len(result.errors)} errors"
+    )
+
+    if result.errors:
+        raise typer.Exit(1)
+
+
+@app.command("link")
+def link_cmd(
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without writing"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Link ideas to relevant personal knowledge areas (Wissen).
+
+    Idempotent: ideas that already have wissen links are skipped.
+    Batches 10 ideas per LLM call (claude-haiku).
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — no files will be written.\n")
+
+    console.print(f"Linking wissen for [cyan]{vault_path}[/cyan] ...\n")
+
+    try:
+        result = run_link(vault_path, dry_run=dry_run, verbose=verbose)
+    except Exception as e:
+        console.print(f"[red]✗ Link failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    if result.skipped and verbose:
+        console.print(f"[dim]Skipped {len(result.skipped)} (already linked)[/dim]")
+
+    if result.linked:
+        label = "would link" if dry_run else "linked"
+        console.print(f"[bold]Wissen links[/bold] ({len(result.linked)} ideas {label}):")
+        for idea_id, wids in result.linked:
+            prefix = "[dim]~[/dim]" if dry_run else "[green]→[/green]"
+            wissen_str = ", ".join(wids) if wids else "(to be generated)"
+            console.print(f"  {prefix} {idea_id}: {wissen_str}")
+
+    if result.errors:
+        console.print(f"[red]Errors ({len(result.errors)}):[/red]")
+        for iid, msg in result.errors:
+            console.print(f"  [red]✗[/red] {iid}: {msg}")
+
+    console.print(
+        f"\nDone. {len(result.linked)} linked · "
+        f"{len(result.skipped)} skipped · "
+        f"{len(result.errors)} errors"
+    )
+
+
+@app.command("score")
+def score_cmd(
+    vault: Optional[Path] = _vault_option,
+    tier: int = typer.Option(0, "--tier", "-t", help="Research tier (0=vault only)"),
+    top: Optional[int] = typer.Option(None, "--top", "-n", help="Show only top N ideas"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Compute scores without writing to vault"),
+) -> None:
+    """Score all ideas and print a leaderboard (T0: vault-only, no research).
+
+    Writes score, score_breakdown, score_version, scored_at into each idea note.
+    Idempotent — safe to re-run after adding new chances or wissen links.
+    """
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if tier != 0:
+        console.print(f"[red]✗ Only --tier 0 is implemented (got {tier})[/red]")
+        raise typer.Exit(1)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — scores computed but not written.\n")
+
+    console.print(f"Scoring [cyan]{vault_path}[/cyan] (T0) ...\n")
+
+    try:
+        result = score_vault(vault_path, dry_run=dry_run, top_n=top)
+    except Exception as e:
+        console.print(f"[red]✗ Scoring failed:[/red] {e}")
+        raise typer.Exit(1)
+
+    from rich.table import Table
+    table = Table(title=f"Leaderboard — T0{'  (dry run)' if dry_run else ''}", show_lines=False)
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Idea", style="cyan", no_wrap=False, max_width=55)
+    table.add_column("Score", justify="right", style="bold green")
+
+    for rank, (idea_id, score) in enumerate(result.scored, 1):
+        table.add_row(str(rank), idea_id, f"{score:.3f}")
+
+    console.print(table)
+    console.print(f"\n[dim]{len(result.scored)} ideas scored[/dim]")
+
+
+@app.command("research")
+def research_cmd(
+    vault: Optional[Path] = _vault_option,
+    tier: int = typer.Option(1, "--tier", "-t", help="1=Tavily  2=Claude+WebSearch  3=Perplexity  4=Firecrawl  5=AutoResearch"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Max ideas to process (default: tier default)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without calling APIs or writing"),
+    force: bool = typer.Option(False, "--force", help="Re-run even if idea already has this tier or higher"),
+) -> None:
+    """Enrich ideas with external market research.
+
+    T1=Tavily (all 142), T2=Claude+WebSearch (top 50), T3=Perplexity (top 10),
+    T4=Firecrawl full-scrape (top 5), T5=AutoResearch 3-loop (top 5).
+    Idempotent: skips ideas already at this tier or higher unless --force.
+    """
+    import datetime
+
+    from idea_pipeline.research.web import MIN_CREDITS, TIER_LIMITS, get_researcher, tier_level
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    if tier not in range(1, 6):
+        console.print(f"[red]✗ --tier must be 1–5 (got {tier})[/red]")
+        raise typer.Exit(1)
+
+    # T5 cost warning
+    if tier == 5 and not dry_run:
+        console.print(
+            "[bold yellow]⚠ T5 ist token-intensiv (~$2–5 pro Idee).[/bold yellow]"
+        )
+        if not typer.confirm("Fortfahren?", default=False):
+            raise typer.Exit(0)
+
+    effective_limit = limit if limit is not None else (TIER_LIMITS.get(tier) or 10)
+
+    if dry_run:
+        console.print("[bold yellow]Dry run[/bold yellow] — no APIs called, no files written.\n")
+
+    score_result = score_vault(vault_path, dry_run=True)
+    top_ideas = score_result.scored[:effective_limit]
+
+    from idea_pipeline.schemas import IdeeNote
+    from idea_pipeline.vault_io import list_notes as _list_notes
+    from idea_pipeline.vault_io import write_note as _write_note
+
+    ideen_by_id = {n.model.id: n for n in _list_notes(vault_path, IdeeNote).notes}
+
+    if dry_run:
+        console.print(f"Would research up to {len(top_ideas)} ideas at tier {tier}:")
+        skipped = 0
+        for idea_id, score in top_ideas:
+            vnote = ideen_by_id.get(idea_id)
+            current = tier_level(vnote.model.research_fidelity if vnote else None)
+            skip = not force and current >= tier
+            label = f"[dim](skip — already {vnote.model.research_fidelity})[/dim]" if skip else ""
+            skipped += skip
+            console.print(f"  [cyan]{idea_id}[/cyan] (score={score:.3f}) {label}")
+        stats = cache_stats()
+        console.print(f"\n[dim]{skipped} would be skipped · Cache: {stats['total']} entries[/dim]")
+        return
+
+    try:
+        researcher = get_researcher(tier)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1)
+
+    fidelity = f"tier{tier}"
+    written = 0
+    skipped = 0
+    errors = 0
+    report_entries: list[dict] = []
+    t5_runs_dir = Path(__file__).resolve().parent.parent.parent / "runs"
+
+    for rank, (idea_id, score) in enumerate(top_ideas, 1):
+        vnote = ideen_by_id.get(idea_id)
+        if vnote is None:
+            continue
+        idea = vnote.model
+
+        # Idempotency: skip if already at this tier or higher
+        if not force and tier_level(idea.research_fidelity) >= tier:
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [dim]{idea_id} — skip "
+                f"({idea.research_fidelity})[/dim]"
+            )
+            skipped += 1
+            continue
+
+        # T5: require tier4 to be done first
+        if tier == 5 and tier_level(idea.research_fidelity) < 4:
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [yellow]{idea_id} — skip "
+                f"(T5 requires tier4 first)[/yellow]"
+            )
+            skipped += 1
+            continue
+
+        # Credit gate for T4 (Firecrawl)
+        if tier == 4:
+            remaining = researcher.remaining_credits()
+            if remaining < MIN_CREDITS:
+                console.print(
+                    f"\n[yellow]⚠ Only {remaining} Firecrawl credits left — stopping early.[/yellow]"
+                )
+                break
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [cyan]{idea_id}[/cyan] "
+                f"[dim](credits: {remaining})[/dim] ...",
+                end=" ",
+            )
+        else:
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [cyan]{idea_id}[/cyan] ...", end=" "
+            )
+
+        try:
+            if tier == 5:
+                existing_ctx = idea.research_notes or ""
+                scores, research_notes, _ = researcher.research_idea(
+                    idea_id, idea.description or idea_id, existing_ctx
+                )
+            else:
+                result = researcher.research_idea(idea_id, idea.description or idea_id)
+                scores, narrative = result if isinstance(result, tuple) else (result, "")
+                research_notes = ""
+        except Exception as e:
+            console.print(f"[red]error: {e}[/red]")
+            errors += 1
+            continue
+
+        if tier == 5:
+            if not research_notes:
+                console.print("[dim]no data[/dim]")
+                continue
+            idea.research_notes = research_notes
+            idea.research_fidelity = fidelity
+            _write_note(vnote)
+            written += 1
+            console.print("[green]✓[/green]")
+            # Save per-idea markdown
+            t5_runs_dir.mkdir(exist_ok=True)
+            today = datetime.date.today().isoformat()
+            (t5_runs_dir / f"t5_{idea_id}_{today}.md").write_text(
+                research_notes, encoding="utf-8"
+            )
+        else:
+            if not scores:
+                console.print("[dim]no data[/dim]")
+                continue
+            for field, val in scores.items():
+                setattr(idea, field, val)
+            idea.research_fidelity = fidelity
+            _write_note(vnote)
+            written += 1
+            console.print(f"[green]✓[/green] {scores}")
+
+            if tier >= 2 and narrative:
+                wissen_links = idea.wissen or []
+                report_entries.append({
+                    "rank": rank,
+                    "idea_id": idea_id,
+                    "score": score,
+                    "scores": scores,
+                    "narrative": narrative,
+                    "description": idea.description or "",
+                    "wissen": [
+                        str(w).strip("[]").replace("[[", "").replace("]]", "")
+                        for w in wissen_links
+                    ],
+                })
+
+    if tier != 5:
+        console.print("\nRe-scoring vault ...")
+        score_vault(vault_path)
+
+    # Write narrative review report (T2–T4)
+    if report_entries:
+        reports_dir = Path(__file__).resolve().parent.parent.parent / "reports"
+        reports_dir.mkdir(exist_ok=True)
+        today = datetime.date.today().isoformat()
+        report_path = reports_dir / f"t{tier}_review_{today}.md"
+        lines = [
+            f"# T{tier} Market Research Review — {today}\n",
+            f"Generated by `ideapipe research --tier {tier} --limit {effective_limit}`\n",
+            "---\n",
+        ]
+        for e in report_entries:
+            sc = e["scores"]
+            lines += [
+                f"## #{e['rank']} — {e['idea_id']}  (pipeline score: {e['score']:.3f})\n",
+                f"**Knowledge areas:** {', '.join(e['wissen']) or '—'}\n",
+                f"**Scores (1=best, 6=worst):** "
+                f"market_size={sc.get('market_size','—')}  "
+                f"market_potential={sc.get('market_potential','—')}  "
+                f"prevalence={sc.get('prevalence','—')}  "
+                f"market_awareness={sc.get('market_awareness','—')}\n",
+                f"**Research findings:**\n{e['narrative']}\n",
+                f"> *Description:* {e['description'][:300]}\n",
+                "\n---\n",
+            ]
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        console.print(f"\n[bold]Review report:[/bold] {report_path}")
+
+    stats = cache_stats()
+    console.print(
+        f"\nDone. {written} enriched · {skipped} skipped · {errors} errors · "
+        f"cache: {stats['total']} entries"
+    )
+
+
+@app.command("report")
+def report_cmd(
+    vault: Optional[Path] = _vault_option,
+    out: Path = typer.Option(Path("LEADERBOARD.md"), "--out", "-o", help="Output markdown file"),
+) -> None:
+    """Write LEADERBOARD.md — a ranked markdown table of all scored ideas.
+
+    Commit after each research tier to track score progression via git diff.
+    """
+    import datetime
+    import yaml
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    # Load all idea notes with metadata directly (avoid double-parsing via score_vault)
+    ideas: list[dict] = []
+    for f in vault_path.glob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        if not text.startswith("---"):
+            continue
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            continue
+        try:
+            meta = yaml.safe_load(parts[1]) or {}
+        except Exception:
+            continue
+        db = meta.get("database") or []
+        if isinstance(db, str):
+            db = [db]
+        if not any("geschaeftsideen" in str(d) for d in db):
+            continue
+        if meta.get("score") is None:
+            continue
+        ideas.append({"id": f.stem, **meta})
+
+    ideas.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    def fmt(v, fallback="—"):
+        return str(v) if v is not None else fallback
+
+    def tier_badge(t):
+        return {"tier1": "T1", "tier2": "T2", "tier3": "T3",
+                "tier4": "T4", "tier5": "T5"}.get(t or "", "—")
+
+    def wissen_str(meta):
+        links = meta.get("wissen") or []
+        if isinstance(links, str):
+            links = [links]
+        names = [str(w).strip("[]").replace("[[", "").replace("]]", "") for w in links]
+        return ", ".join(names) if names else "—"
+
+    today = datetime.date.today().isoformat()
+    lines = [
+        f"# Idea Leaderboard — {today}",
+        "",
+        f"**{len(ideas)} ideas scored** · generated by `ideapipe report`",
+        "",
+        "| # | Idea | Score | Tier | mSz | mPot | prev | mAw | ch↑ | ws↑ | intr↑ | Wissen |",
+        "|---|------|------:|:----:|:---:|:----:|:----:|:---:|:---:|:---:|:-----:|--------|",
+    ]
+
+    for rank, m in enumerate(ideas, 1):
+        sb = m.get("score_breakdown") or {}
+        lines.append(
+            f"| {rank} "
+            f"| {m['id']} "
+            f"| {m.get('score', 0):.3f} "
+            f"| {tier_badge(m.get('research_fidelity'))} "
+            f"| {fmt(m.get('market_size'))} "
+            f"| {fmt(m.get('market_potential'))} "
+            f"| {fmt(m.get('prevalence'))} "
+            f"| {fmt(m.get('market_awareness'))} "
+            f"| {sb.get('chance_score', 0):.1f} "
+            f"| {sb.get('wissen_score', 0):.1f} "
+            f"| {sb.get('intrinsic_score', 0):.1f} "
+            f"| {wissen_str(m)} |"
+        )
+
+    lines += [
+        "",
+        "---",
+        "",
+        "**Column guide**",
+        "- **Score**: composite pipeline score (higher = better, max 6.0)",
+        "- **Tier**: highest research tier completed (T1=Tavily … T5=AutoResearch)",
+        "- **mSz** market_size · **mPot** market_potential · **prev** prevalence · **mAw** market_awareness — all 1–6 (1=best)",
+        "- **ch↑** chance score · **ws↑** wissen score · **intr↑** intrinsic score — components of composite (higher=better)",
+        "",
+    ]
+
+    # Resolve output path: relative to repo root if not absolute
+    if not out.is_absolute():
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        out = repo_root / out
+
+    out.write_text("\n".join(lines), encoding="utf-8")
+    console.print(f"[green]✓[/green] {out}  ({len(ideas)} ideas)")
+    console.print(f"[dim]Commit with: git add {out.name} && git commit -m 'leaderboard: {today}'[/dim]")
+
+
+if __name__ == "__main__":
+    app()
+
+
+---
+src/idea_pipeline/enrich.py
+---
+"""Step 6: LLM-Enrichment — chance generation and descriptions.
+
+Four phases, all idempotent:
+  1. Stubs       — create minimal ChanceNote for every broken chance link
+  2. Generation  — for ideas with zero chance links, LLM suggests 3-6 chances
+  3. Descriptions — batch-generate 1-2 sentence descriptions for undescribed chances
+  4. Umbrella    — LLM suggests umbrella_problem hierarchy links
+
+All LLM calls: batched JSON output, model=haiku (cheap classification tasks).
+Results written back to vault with research_fidelity=tier0.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+from idea_pipeline.schemas import ChanceNote, IdeeNote
+from idea_pipeline.vault_io import VaultNote, list_notes, write_note
+
+load_dotenv()
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROMPTS_DIR = _PROJECT_ROOT / "config" / "prompts" / "v1"
+
+_HAIKU = "claude-haiku-4-5-20251001"
+_BATCH_SIZE = 10
+
+
+@dataclass
+class EnrichResult:
+    stubs_created: list[str] = field(default_factory=list)
+    chances_linked: list[tuple[str, list[str]]] = field(default_factory=list)
+    descriptions_written: list[str] = field(default_factory=list)
+    umbrellas_written: list[str] = field(default_factory=list)
+    errors: list[tuple[str, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_client():
+    from anthropic import Anthropic
+    return Anthropic()
+
+
+def _read_prompt(name: str) -> str:
+    return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+
+
+def _batched(items: list, size: int = _BATCH_SIZE):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _parse_json_response(text: str) -> Any:
+    text = text.strip()
+    if text.startswith("```"):
+        # strip markdown code fence
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return json.loads(text)
+
+
+def _llm_call(client, system: str, user: Any) -> str:
+    resp = client.messages.create(
+        model=_HAIKU,
+        max_tokens=2048,
+        system=system,
+        messages=[{"role": "user", "content": json.dumps(user, ensure_ascii=False)}],
+    )
+    return resp.content[0].text
+
+
+def _make_chance_stub(cid: str, vault_path: Path, description: str | None = None) -> VaultNote:
+    model = ChanceNote(
+        id=cid,
+        database=["chancen🌋"],
+        status="neu",
+        description=description,
+    )
+    return VaultNote(model=model, body="", path=vault_path / f"{cid}.md")
+
+
+def _get_linked_idea_ids(chance_id: str, all_ideen: list[VaultNote]) -> list[str]:
+    return [v.model.id for v in all_ideen if chance_id in v.model.chancen]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: description generation
+# ---------------------------------------------------------------------------
+
+def _generate_descriptions(
+    items: list[dict], client
+) -> dict[str, str]:
+    """Batch-generate descriptions. Returns {chance_id: description}."""
+    system = _read_prompt("enrich_chances.txt")
+    results: dict[str, str] = {}
+    for batch in _batched(items):
+        try:
+            raw = _llm_call(client, system, batch)
+            data = _parse_json_response(raw)
+            for entry in data:
+                results[entry["id"]] = entry["description"]
+        except Exception as e:
+            for entry in batch:
+                results[f"__error__{entry['id']}"] = str(e)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: chance generation for ideas without links
+# ---------------------------------------------------------------------------
+
+def _generate_chances_for_idea(
+    idea_id: str, idea_desc: str, existing: list[dict], client
+) -> dict:
+    """Returns {"linked_existing": [...], "new_chances": [{id, description}]}."""
+    system = _read_prompt("generate_chances.txt")
+    payload = {
+        "idea_id": idea_id,
+        "idea_description": idea_desc,
+        "existing_chances": existing,
+    }
+    raw = _llm_call(client, system, payload)
+    return _parse_json_response(raw)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: umbrella links
+# ---------------------------------------------------------------------------
+
+def _suggest_umbrella_links(
+    all_chances: list[dict], client
+) -> dict[str, list[str]]:
+    """Returns {chance_id: [umbrella_id, ...]}."""
+    if not all_chances:
+        return {}
+    system = _read_prompt("umbrella_links.txt")
+    try:
+        raw = _llm_call(client, system, all_chances)
+        data = _parse_json_response(raw)
+        return {
+            item["id"]: item["umbrella_ids"]
+            for item in data
+            if item.get("umbrella_ids")
+        }
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run_enrich(
+    vault_path: Path,
+    dry_run: bool = False,
+    verbose: bool = False,
+    skip_umbrella: bool = False,
+) -> EnrichResult:
+    result = EnrichResult()
+
+    # Load vault (no API client needed until Phase 2+)
+    ideen = list_notes(vault_path, IdeeNote).notes
+    chancen_by_id: dict[str, VaultNote] = {
+        n.model.id: n for n in list_notes(vault_path, ChanceNote).notes
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 1: create stubs for broken chance links (no LLM needed)
+    # ------------------------------------------------------------------
+    missing: set[str] = set()
+    for vnote in ideen:
+        for cid in vnote.model.chancen:
+            if cid not in chancen_by_id:
+                missing.add(cid)
+
+    for cid in sorted(missing):
+        stub = _make_chance_stub(cid, vault_path)
+        if not dry_run:
+            write_note(stub)
+            chancen_by_id[cid] = stub
+        result.stubs_created.append(cid)
+        if verbose:
+            print(f"  stub: {cid}")
+
+    # In dry-run mode: skip all LLM phases, just report what would be touched.
+    if dry_run:
+        ideas_without_chances = [v for v in ideen if not v.model.chancen]
+        result.chances_linked = [(v.model.id, []) for v in ideas_without_chances]
+
+        needs_desc_count = sum(
+            1 for n in chancen_by_id.values() if not n.model.description
+        )
+        # Represent as placeholder list for the summary
+        result.descriptions_written = [f"(~{needs_desc_count} chances)"]
+
+        needs_umbrella_count = sum(
+            1 for n in chancen_by_id.values() if not n.model.umbrella_problem
+        ) if not skip_umbrella else 0
+        result.umbrellas_written = [f"(~{needs_umbrella_count} chances)"] if needs_umbrella_count else []
+
+        return result
+
+    # Real run — need the API client from here on
+    client = _get_client()
+
+    # ------------------------------------------------------------------
+    # Phase 2: generate chances for ideas with no links at all
+    # ------------------------------------------------------------------
+    ideas_without_chances = [v for v in ideen if not v.model.chancen]
+
+    if ideas_without_chances:
+        existing_list = [
+            {
+                "id": cid,
+                "description": n.model.description or cid.replace("_", " "),
+            }
+            for cid, n in chancen_by_id.items()
+        ]
+        for vnote in ideas_without_chances:
+            idea = vnote.model
+            try:
+                suggestion = _generate_chances_for_idea(
+                    idea.id, idea.description or "", existing_list, client
+                )
+            except Exception as e:
+                result.errors.append((idea.id, f"chance generation failed: {e}"))
+                continue
+
+            new_links: list[str] = list(suggestion.get("linked_existing", []))
+
+            for new_c in suggestion.get("new_chances", []):
+                cid = new_c["id"]
+                if cid in chancen_by_id:
+                    new_links.append(cid)
+                    continue
+                stub = _make_chance_stub(cid, vault_path, new_c.get("description"))
+                write_note(stub)
+                chancen_by_id[cid] = stub
+                result.stubs_created.append(cid)
+                new_links.append(cid)
+                existing_list.append({"id": cid, "description": new_c.get("description", "")})
+
+            idea.chancen = new_links
+            write_note(VaultNote(model=idea, body=vnote.body, path=vnote.path))
+            result.chances_linked.append((idea.id, new_links))
+
+    # ------------------------------------------------------------------
+    # Phase 3: descriptions for undescribed chances
+    # ------------------------------------------------------------------
+    needs_desc = [
+        {
+            "id": cid,
+            "name": cid.replace("_", " "),
+            "linked_ideas": _get_linked_idea_ids(cid, ideen),
+        }
+        for cid, n in chancen_by_id.items()
+        if not n.model.description
+    ]
+
+    if needs_desc:
+        desc_map = _generate_descriptions(needs_desc, client)
+        for cid, desc in desc_map.items():
+            if cid.startswith("__error__"):
+                real_id = cid[len("__error__"):]
+                result.errors.append((real_id, f"description generation failed: {desc}"))
+                continue
+            if cid not in chancen_by_id:
+                continue
+            vnote = chancen_by_id[cid]
+            vnote.model.description = desc
+            vnote.model.research_fidelity = "tier0"
+            write_note(vnote)
+            result.descriptions_written.append(cid)
+
+    # ------------------------------------------------------------------
+    # Phase 4: umbrella problem links
+    # ------------------------------------------------------------------
+    if not skip_umbrella:
+        all_chance_list = [
+            {
+                "id": cid,
+                "description": n.model.description or cid.replace("_", " "),
+            }
+            for cid, n in chancen_by_id.items()
+        ]
+        try:
+            umbrella_map = _suggest_umbrella_links(all_chance_list, client)
+        except Exception as e:
+            result.errors.append(("umbrella_phase", str(e)))
+            umbrella_map = {}
+
+        for cid, umbrella_ids in umbrella_map.items():
+            if cid not in chancen_by_id:
+                continue
+            vnote = chancen_by_id[cid]
+            if vnote.model.umbrella_problem:
+                continue  # already set — idempotent
+            valid = [uid for uid in umbrella_ids if uid in chancen_by_id]
+            if valid:
+                vnote.model.umbrella_problem = valid
+                write_note(vnote)
+                result.umbrellas_written.append(cid)
+
+    return result
+
+
+---
+src/idea_pipeline/generator.py
+---
+"""Idea generator: synthesize new ideas from chances × wissen + web research.
+
+TODO Step 10: Generate new idea notes inspired by existing chances and wissen,
+write them into the vault in the same template format, feed into the scoring loop.
+"""
+
+
+---
+src/idea_pipeline/ingest.py
+---
+"""Ingest: create vault notes from simple name:description pairs.
+
+This is the "front door" for getting ideas into the vault quickly.
+You provide a list of ideas (name + description), and the pipeline
+creates properly structured notes from them.
+
+Supports three note types:
+- idee (default): creates IdeeNote with all score defaults
+- chance: creates ChanceNote
+- wissen: creates WissenNote (scores must be filled manually later)
+
+Input format (one per line):
+  name: description text here
+  another_name: another description
+
+Names are sanitized into valid filenames (lowercase, underscores,
+no special characters). If a file already exists, it is skipped
+(idempotent — safe to run multiple times).
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from idea_pipeline.schemas import BaseNote, ChanceNote, IdeeNote, WissenNote
+from idea_pipeline.vault_io import VaultNote, write_note
+
+
+@dataclass
+class IngestItem:
+    """A single parsed name:description pair."""
+
+    name: str  # raw name from input
+    filename: str  # sanitized filename (without .md)
+    description: str
+
+
+@dataclass
+class IngestResult:
+    """Summary of an ingest operation."""
+
+    created: list[str]  # filenames of newly created notes
+    skipped: list[str]  # filenames that already existed
+    errors: list[tuple[str, str]]  # (filename, error message)
+
+
+def sanitize_filename(name: str) -> str:
+    """Convert a human-readable name into a valid vault filename.
+
+    Rules:
+    - Lowercase
+    - Spaces and hyphens → underscores
+    - Remove everything that isn't alphanumeric, underscore, or period
+    - Collapse multiple underscores
+    - Strip leading/trailing underscores
+    - Transliterate unicode (ä→ae, ü→ue, etc.) via NFKD decomposition
+
+    Examples:
+        "Urban Mushroom Farm" → "urban_mushroom_farm"
+        "Balkongärten (v2)"  → "balkongarten_v2"
+        "my--weird   name!"  → "my_weird_name"
+    """
+    # Normalize unicode: decompose, strip combining marks
+    normalized = unicodedata.normalize("NFKD", name)
+    ascii_ish = normalized.encode("ascii", errors="ignore").decode("ascii")
+
+    # Lowercase, replace spaces/hyphens with underscores
+    result = ascii_ish.lower()
+    result = re.sub(r"[\s\-]+", "_", result)
+
+    # Remove anything that's not alphanumeric or underscore
+    result = re.sub(r"[^a-z0-9_]", "", result)
+
+    # Collapse multiple underscores, strip edges
+    result = re.sub(r"_+", "_", result)
+    result = result.strip("_")
+
+    return result or "unnamed"
+
+
+def parse_ingest_input(text: str) -> list[IngestItem]:
+    """Parse multiline text into IngestItem list.
+
+    Expected format (one per line):
+        name: description text here
+        another name: another description
+
+    Lines starting with # are comments. Empty lines are skipped.
+    If a line has no colon, the entire line is treated as the name
+    with an empty description.
+    """
+    items: list[IngestItem] = []
+
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if ":" in line:
+            name_part, desc_part = line.split(":", 1)
+            name_part = name_part.strip()
+            desc_part = desc_part.strip()
+        else:
+            name_part = line
+            desc_part = ""
+
+        if not name_part:
+            continue
+
+        filename = sanitize_filename(name_part)
+        items.append(IngestItem(
+            name=name_part,
+            filename=filename,
+            description=desc_part,
+        ))
+
+    return items
+
+
+def _make_model(
+    note_type: str,
+    item: IngestItem,
+) -> BaseNote:
+    """Create a Pydantic model from an IngestItem.
+
+    Returns a model with all defaults set and description filled in.
+    """
+    common = {
+        "id": item.filename,
+        "status": "roh",
+        "description": item.description or None,
+    }
+
+    if note_type == "idee":
+        return IdeeNote(
+            database=["geschaeftsideen🎲"],
+            **common,
+        )
+    elif note_type == "chance":
+        return ChanceNote(
+            database=["chancen🌋"],
+            status="neu",
+            **{k: v for k, v in common.items() if k != "status"},
+        )
+    elif note_type == "wissen":
+        return WissenNote(
+            database=["wissen🤯"],
+            status="neu",
+            **{k: v for k, v in common.items() if k != "status"},
+        )
+    else:
+        raise ValueError(f"Unknown note type: {note_type}. Use: idee, chance, wissen")
+
+
+def ingest(
+    text: str,
+    vault_path: Path,
+    note_type: str = "idee",
+    dry_run: bool = False,
+) -> IngestResult:
+    """Create vault notes from a multiline name:description input.
+
+    Args:
+        text: multiline input, one "name: description" per line
+        vault_path: path to the vault directory
+        note_type: "idee", "chance", or "wissen"
+        dry_run: if True, don't write files, just report what would happen
+
+    Returns:
+        IngestResult with created/skipped/error counts
+    """
+    items = parse_ingest_input(text)
+    result = IngestResult(created=[], skipped=[], errors=[])
+
+    for item in items:
+        target = vault_path / f"{item.filename}.md"
+
+        # Idempotent: skip if file exists
+        if target.exists():
+            result.skipped.append(item.filename)
+            continue
+
+        try:
+            model = _make_model(note_type, item)
+
+            if not dry_run:
+                vnote = VaultNote(model=model, body="", path=target)
+                write_note(vnote)
+
+            result.created.append(item.filename)
+        except Exception as e:
+            result.errors.append((item.filename, str(e)))
+
+    return result
+
+
+---
+src/idea_pipeline/link.py
+---
+"""Step 7: LLM linking — match ideas to personal knowledge areas (Wissen).
+
+Single phase, idempotent:
+  - Ideas that already have wissen links are skipped.
+  - Remaining ideas are batched (10/call) and sent to Haiku with the full
+    list of WissenNotes as context.
+  - Suggested wissen IDs are validated against known wissen before writing.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+from idea_pipeline.schemas import IdeeNote, WissenNote
+from idea_pipeline.vault_io import VaultNote, list_notes, write_note
+
+load_dotenv()
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_PROMPTS_DIR = _PROJECT_ROOT / "config" / "prompts" / "v1"
+
+_HAIKU = "claude-haiku-4-5-20251001"
+_BATCH_SIZE = 10
+
+
+@dataclass
+class LinkResult:
+    linked: list[tuple[str, list[str]]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    errors: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _get_client():
+    from anthropic import Anthropic
+    return Anthropic()
+
+
+def _read_prompt(name: str) -> str:
+    return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+
+
+def _batched(items: list, size: int = _BATCH_SIZE):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _parse_json_response(text: str) -> list:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return json.loads(text)
+
+
+def run_link(
+    vault_path: Path,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> LinkResult:
+    result = LinkResult()
+
+    ideen = list_notes(vault_path, IdeeNote).notes
+    wissen_notes = list_notes(vault_path, WissenNote).notes
+    known_wissen_ids = {n.model.id for n in wissen_notes}
+
+    wissen_list = [
+        {"id": n.model.id, "description": n.model.description or n.model.id.replace("_", " ")}
+        for n in wissen_notes
+    ]
+
+    to_link: list[VaultNote] = []
+    for vnote in ideen:
+        if vnote.model.wissen:
+            result.skipped.append(vnote.model.id)
+        else:
+            to_link.append(vnote)
+
+    if verbose:
+        print(f"  {len(result.skipped)} ideas already linked, {len(to_link)} to process")
+
+    if dry_run or not to_link:
+        result.linked = [(v.model.id, []) for v in to_link]
+        return result
+
+    client = _get_client()
+    system = _read_prompt("link_wissen.txt")
+    vnote_by_id = {v.model.id: v for v in to_link}
+
+    for batch in _batched(to_link):
+        ideas_payload = [
+            {"id": v.model.id, "description": v.model.description or ""}
+            for v in batch
+        ]
+        payload = {"ideas": ideas_payload, "wissen": wissen_list}
+
+        try:
+            resp = client.messages.create(
+                model=_HAIKU,
+                max_tokens=1024,
+                system=system,
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            )
+            data = _parse_json_response(resp.content[0].text)
+        except Exception as e:
+            for v in batch:
+                result.errors.append((v.model.id, str(e)))
+            continue
+
+        for entry in data:
+            idea_id = entry.get("idea_id", "")
+            raw_ids = entry.get("wissen_ids", [])
+            valid_ids = [wid for wid in raw_ids if wid in known_wissen_ids]
+            if not valid_ids or idea_id not in vnote_by_id:
+                continue
+            vnote = vnote_by_id[idea_id]
+            vnote.model.wissen = valid_ids
+            write_note(vnote)
+            result.linked.append((idea_id, valid_ids))
+            if verbose:
+                print(f"  → {idea_id}: {', '.join(valid_ids)}")
+
+    return result
+
+
+---
+src/idea_pipeline/schemas.py
+---
+"""Pydantic schemas for vault entities: Idee, Chance, Wissen.
+
+Why Pydantic v2:
+- Validate frontmatter on read, fail-fast on bad data
+- Type-safe access throughout the pipeline (IDE autocomplete, mypy)
+- Built-in serialization back to YAML for write operations (Step 3)
+- Field aliases handle existing typos without forcing vault migration
+
+Design decisions:
+- BaseNote holds the fields common to all three types
+- Score values: int 1-6 (smaller = better, per user convention)
+- Wikilinks like '[[01_07_chance]]' are parsed to bare IDs ('01_07_chance')
+- 'id' is derived from the filename, not stored in frontmatter
+- Note type is detected from the `database` field (NOT the filename),
+  because real vault uses semantic filenames without type suffixes
+- Existing typos in user vault (credebility, umprella_problem) preserved via
+  aliases — clean Python names, original YAML preserved on write
+- Unknown fields are tolerated (extra="allow") so vault can grow without
+  schema migration overhead — but core typed fields are validated strictly
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Annotated, Any, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# A score value: integer 1-6 inclusive. 1 = best, 6 = worst (user convention).
+ScoreValue = Annotated[int, Field(ge=1, le=6)]
+
+
+# Wikilink pattern: matches [[target]] or [[target|alias]]
+_WIKILINK_RE = re.compile(r"^\[\[([^\]|]+)(?:\|[^\]]+)?\]\]$")
+
+
+def _parse_wikilink(value: Any) -> str | None:
+    """Strip [[ ]] from a single wikilink string, return the bare target ID.
+
+    Returns None for empty/None input. Returns the value unchanged if it
+    isn't a wikilink (some fields might hold plain strings).
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        return None
+    match = _WIKILINK_RE.match(value.strip())
+    if match:
+        return match.group(1).strip()
+    return value.strip() or None
+
+
+def _parse_wikilink_list(values: Any) -> list[str]:
+    """Parse a list of wikilink strings into a list of bare IDs.
+
+    Accepts:
+      - None or empty → []
+      - Single string → treated as a one-item list (defensive: handles
+        cases where a user accidentally writes `chancen: "[[foo]]"` instead
+        of `chancen:\n  - "[[foo]]"`)
+      - List of strings → each parsed
+    Filters out empty entries. Handles weird YAML edge cases like '- []'
+    which pyyaml parses as a nested empty list.
+    """
+    if not values:
+        return []
+    if isinstance(values, str):
+        # Defensive: single string → one-item list
+        parsed = _parse_wikilink(values)
+        return [parsed] if parsed else []
+    if not isinstance(values, list):
+        return []
+    result: list[str] = []
+    for v in values:
+        if not v:  # None, "", [], etc.
+            continue
+        parsed = _parse_wikilink(v)
+        if parsed:
+            result.append(parsed)
+    return result
+
+
+def _coerce_string_list(values: Any) -> list[str]:
+    """Normalize a field that should be a list-of-strings.
+
+    YAML may give us None, a single string, or a list. We want list[str].
+    """
+    if values is None or values == "":
+        return []
+    if isinstance(values, str):
+        return [values]
+    if isinstance(values, list):
+        return [str(x) for x in values if x not in (None, "", [])]
+    return [str(values)]
+
+
+class BaseNote(BaseModel):
+    """Fields shared across Idee, Chance, Wissen notes."""
+
+    model_config = ConfigDict(
+        # Allow unknown fields — vault frontmatter may grow over time
+        # (prio, monat, custom user fields, etc. pass through untouched)
+        extra="allow",
+        # Allow both alias and field name on input
+        populate_by_name=True,
+    )
+
+    # Identity — populated programmatically from filename, not from YAML
+    id: str = Field(default="", description="Note ID, derived from filename")
+
+    # Common Obsidian metadata
+    database: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    status: Optional[str] = None
+    aliases: list[str] = Field(default_factory=list)
+    project: Optional[str] = None
+    source: Optional[str] = None
+    link: Optional[str] = None
+    type: str = "notiz"
+
+    # Content + timestamps (common across all real vault notes)
+    description: Optional[str] = None
+    created: Optional[str] = None
+    modified: Optional[str] = None
+
+    # Pipeline-managed fields (filled by scoring/research in later steps)
+    score: Optional[float] = None
+    score_breakdown: Optional[dict] = None
+    score_version: Optional[str] = None
+    scored_at: Optional[str] = None
+    research_fidelity: Optional[str] = None  # tier1 … tier5
+    research_notes: Optional[str] = None    # T5 qualitative findings (markdown)
+
+    @field_validator("database", mode="before")
+    @classmethod
+    def _parse_database_links(cls, v: Any) -> list[str]:
+        return _parse_wikilink_list(v)
+
+    @field_validator("tags", "aliases", mode="before")
+    @classmethod
+    def _coerce_to_list(cls, v: Any) -> list:
+        return _coerce_string_list(v)
+
+
+class IdeeNote(BaseNote):
+    """A business idea — the entity we ultimately rank."""
+
+    # Customer breakdown: explicit two-stage segmentation.
+    # NOTE: legacy `customer` field is no longer modeled. If old notes still
+    # have it, extra="allow" preserves it as raw passthrough (not used by
+    # the pipeline). Migration to first_adopters/mass_customers is a
+    # one-time LLM-enrichment task in Step 6+.
+    first_adopters: list[str] = Field(default_factory=list)
+    mass_customers: list[str] = Field(default_factory=list)
+
+    market_size: ScoreValue = 6
+    market_potential: ScoreValue = 6
+    impact: ScoreValue = 6
+    difficulty: ScoreValue = 6
+    time_investment: ScoreValue = 6
+    innovativeness: ScoreValue = 6
+
+    # Links to chance and wissen notes (parsed from wikilinks)
+    chancen: list[str] = Field(default_factory=list)
+    wissen: list[str] = Field(default_factory=list)
+
+    notes: Optional[str] = None
+
+    @field_validator("chancen", "wissen", mode="before")
+    @classmethod
+    def _parse_link_lists(cls, v: Any) -> list[str]:
+        return _parse_wikilink_list(v)
+
+    @field_validator("first_adopters", "mass_customers", mode="before")
+    @classmethod
+    def _coerce_customer_lists(cls, v: Any) -> list[str]:
+        return _coerce_string_list(v)
+
+
+class ChanceNote(BaseNote):
+    """A problem field / opportunity space — what an idea addresses."""
+
+    granularitaet: ScoreValue = 6
+    urgency: ScoreValue = 6
+    prevalence: ScoreValue = 6
+    impact: ScoreValue = 6
+    personal_experience: ScoreValue = 6
+    market_awareness: ScoreValue = 6
+
+    # NOTE: User's vault has the typo 'umprella_problem'.
+    # Python uses the corrected name; YAML alias preserves the original key.
+    umbrella_problem: list[str] = Field(
+        default_factory=list,
+        alias="umprella_problem",
+    )
+
+    @field_validator("umbrella_problem", mode="before")
+    @classmethod
+    def _parse_umbrella(cls, v: Any) -> list[str]:
+        return _parse_wikilink_list(v)
+
+
+class WissenNote(BaseNote):
+    """A personal knowledge area — skills/networks the user can leverage."""
+
+    enjoyment: ScoreValue = 6
+    confidence: ScoreValue = 6
+
+    # NOTE: User's vault has the typo 'credebility'.
+    # Python uses the corrected name; YAML alias preserves the original key.
+    credibility: ScoreValue = Field(default=6, alias="credebility")
+
+    contacts: ScoreValue = 6
+
+
+# --- Type dispatch -----------------------------------------------------------
+
+# The vault uses an Obsidian database pattern: each note links to a "database"
+# wikilink that identifies its type. We strip emoji and check for the keyword.
+DATABASE_TYPE_MAP: dict[str, type[BaseNote]] = {
+    "geschaeftsideen": IdeeNote,
+    "chancen": ChanceNote,
+    "wissen": WissenNote,
+}
+
+
+def detect_note_type(metadata: dict) -> Optional[type[BaseNote]]:
+    """Detect the appropriate schema class from the note's `database` field.
+
+    The vault uses semantic filenames (no _idee/_chance/_wissen suffix), so
+    we read the type from the YAML `database` list. Each note typically links
+    to one or more database notes like `[[geschaeftsideen🎲]]`.
+
+    Returns None if no recognized database is found.
+    """
+    raw_databases = metadata.get("database")
+    if not raw_databases:
+        return None
+
+    # Reuse the same parser the schema uses — keeps behaviour consistent
+    parsed = _parse_wikilink_list(raw_databases)
+
+    for db_id in parsed:
+        # Match by prefix to handle emoji suffixes like "geschaeftsideen🎲"
+        normalized = db_id.lower()
+        for keyword, schema_cls in DATABASE_TYPE_MAP.items():
+            if normalized.startswith(keyword):
+                return schema_cls
+    return None
+
+
+---
+src/idea_pipeline/scoring.py
+---
+"""Scoring engine: additive, weighted T0 scoring (vault-only, no LLM).
+
+Formula (v1, weights from config/weights.yaml):
+    idea_total = 0.40 * chance_avg + 0.25 * wissen_avg + 0.35 * intrinsic_avg
+
+All raw values inverted (7 - x) so higher score = better idea.
+Missing links → contribution from that category is 0 (not penalised further).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+from idea_pipeline.schemas import ChanceNote, IdeeNote, WissenNote
+from idea_pipeline.vault_io import list_notes, write_note
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+_WEIGHTS_PATH = _PROJECT_ROOT / "config" / "weights.yaml"
+
+
+def _load_weights() -> dict:
+    return yaml.safe_load(_WEIGHTS_PATH.read_text(encoding="utf-8"))
+
+
+def _inv(v: int) -> float:
+    return 7.0 - v
+
+
+def _weighted_avg(values: dict[str, int], weights: dict[str, float]) -> float:
+    total_w = 0.0
+    total_v = 0.0
+    for key, w in weights.items():
+        v = values.get(key)
+        if v is not None:
+            total_v += _inv(v) * w
+            total_w += w
+    return total_v / total_w if total_w else 0.0
+
+
+def _score_chance(chance: ChanceNote, weights: dict) -> float:
+    return _weighted_avg({
+        "granularitaet": chance.granularitaet,
+        "urgency": chance.urgency,
+        "prevalence": chance.prevalence,
+        "impact": chance.impact,
+        "personal_experience": chance.personal_experience,
+        "market_awareness": chance.market_awareness,
+    }, weights["chance"])
+
+
+def _score_wissen(wissen: WissenNote, weights: dict) -> float:
+    return _weighted_avg({
+        "enjoyment": wissen.enjoyment,
+        "confidence": wissen.confidence,
+        "credebility": wissen.credibility,
+        "contacts": wissen.contacts,
+    }, weights["wissen"])
+
+
+def _score_intrinsic(idea: IdeeNote, weights: dict) -> float:
+    return _weighted_avg({
+        "market_size": idea.market_size,
+        "market_potential": idea.market_potential,
+        "impact": idea.impact,
+        "difficulty": idea.difficulty,
+        "time_investment": idea.time_investment,
+        "innovativeness": idea.innovativeness,
+    }, weights["idee_intrinsic"])
+
+
+@dataclass
+class ScoreResult:
+    scored: list[tuple[str, float]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+
+
+def score_vault(
+    vault_path: Path,
+    dry_run: bool = False,
+    top_n: Optional[int] = None,
+) -> ScoreResult:
+    weights = _load_weights()
+    tl = weights["top_level"]
+
+    ideen = list_notes(vault_path, IdeeNote).notes
+    chances_by_id = {n.model.id: n.model for n in list_notes(vault_path, ChanceNote).notes}
+    wissen_by_id = {n.model.id: n.model for n in list_notes(vault_path, WissenNote).notes}
+
+    result = ScoreResult()
+    today = date.today().isoformat()
+
+    for vnote in ideen:
+        idea = vnote.model
+
+        linked_chances = [chances_by_id[cid] for cid in idea.chancen if cid in chances_by_id]
+        chance_score = (
+            sum(_score_chance(c, weights) for c in linked_chances) / len(linked_chances)
+            if linked_chances else 0.0
+        )
+
+        linked_wissen = [wissen_by_id[wid] for wid in idea.wissen if wid in wissen_by_id]
+        wissen_score = (
+            sum(_score_wissen(w, weights) for w in linked_wissen) / len(linked_wissen)
+            if linked_wissen else 0.0
+        )
+
+        intrinsic_score = _score_intrinsic(idea, weights)
+
+        total = round(
+            tl["chance_contribution"] * chance_score
+            + tl["wissen_contribution"] * wissen_score
+            + tl["intrinsic_contribution"] * intrinsic_score,
+            4,
+        )
+
+        result.scored.append((idea.id, total))
+
+        if not dry_run:
+            idea.score = total
+            idea.score_breakdown = {
+                "chance_score": round(chance_score, 4),
+                "wissen_score": round(wissen_score, 4),
+                "intrinsic_score": round(intrinsic_score, 4),
+                "chance_n": len(linked_chances),
+                "wissen_n": len(linked_wissen),
+            }
+            idea.score_version = "v1"
+            idea.scored_at = today
+            write_note(vnote)
+
+    result.scored.sort(key=lambda x: x[1], reverse=True)
+    if top_n:
+        result.scored = result.scored[:top_n]
+
+    return result
+
+
+---
+src/idea_pipeline/settings.py
+---
+"""Pipeline settings — vault path resolution and global config.
+
+The vault path is resolved in this order:
+  1. Explicit CLI argument (--vault)
+  2. IDEAPIPE_VAULT environment variable
+  3. Default: ~/vaults/idea-validation
+
+Why a settings module instead of hardcoding everywhere?
+- Single source of truth for paths
+- Environment variable lets you switch vaults without code changes
+- Claude Code / NL interface can set the env once per session
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+_DEFAULT_VAULT = "~/vaults/idea-validation"
+
+
+def get_vault_path(override: str | Path | None = None) -> Path:
+    """Resolve the active vault path."""
+    if override:
+        return Path(override).expanduser().resolve()
+    raw = os.environ.get("IDEAPIPE_VAULT", _DEFAULT_VAULT)
+    return Path(raw).expanduser().resolve()
+
+
+---
+src/idea_pipeline/vault_io.py
+---
+"""Vault I/O: read, write, and list Obsidian markdown notes.
+
+Core contract for the entire pipeline:
+- read_note()  → validated Pydantic model + body + path
+- write_note() → atomic (temp + rename), wikilinks reconstructed
+- list_notes() → iterate over notes of a given type
+- check_links() → find broken wikilink references
+
+Design decisions:
+- VaultNote bundles model + body + path so nothing gets lost in transit
+- Write is always atomic — never a half-written file on disk
+- Wikilink fields are reconstructed on write ([[id]] format)
+- Unknown fields survive read-write cycles (extra="allow" in Pydantic)
+- YAML format after write may differ cosmetically from input
+  (quote style, key order) but data is identical. If exact format
+  preservation becomes important, swap pyyaml for ruamel.yaml.
+"""
+
+from __future__ import annotations
+
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import frontmatter
+from pydantic import ValidationError
+
+from idea_pipeline.schemas import (
+    BaseNote,
+    ChanceNote,
+    IdeeNote,
+    WissenNote,
+    detect_note_type,
+)
+
+
+# ---------------------------------------------------------------------------
+# VaultNote: the object that flows through the pipeline
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VaultNote:
+    """A note read from (or to be written to) the vault.
+
+    Bundles three things that always travel together:
+    - model:  validated Pydantic schema (frontmatter data)
+    - body:   markdown content below the YAML frontmatter
+    - path:   file location in the vault
+    """
+
+    model: BaseNote
+    body: str
+    path: Path
+
+
+# ---------------------------------------------------------------------------
+# Read
+# ---------------------------------------------------------------------------
+
+def read_note(path: Path) -> VaultNote:
+    """Read a single markdown note, validate against the detected schema.
+
+    Raises:
+        FileNotFoundError: if the file doesn't exist
+        ValueError: if note type can't be detected from `database` field
+        pydantic.ValidationError: if frontmatter data fails schema validation
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Note not found: {path}")
+
+    post = frontmatter.load(path)
+
+    schema_cls = detect_note_type(post.metadata)
+    if schema_cls is None:
+        raise ValueError(
+            f"Cannot detect note type for '{path.name}' "
+            f"(no recognized database field in frontmatter)"
+        )
+
+    data = dict(post.metadata)
+    data["id"] = path.stem  # ID is always the filename without extension
+
+    model = schema_cls.model_validate(data)
+    return VaultNote(model=model, body=post.content.strip(), path=path)
+
+
+# ---------------------------------------------------------------------------
+# Write (atomic)
+# ---------------------------------------------------------------------------
+
+# YAML keys whose list values must be wrapped in [[]] on write.
+# These are the keys AS THEY APPEAR IN YAML (i.e., aliases, not Python names).
+_WIKILINK_YAML_KEYS = frozenset({
+    "database",
+    "chancen",
+    "wissen",
+    "umprella_problem",  # alias of umbrella_problem
+})
+
+
+def _to_yaml_dict(note: BaseNote) -> dict:
+    """Convert a Pydantic model to a YAML-serializable dict.
+
+    Handles:
+    - Alias serialization (credebility, umprella_problem → preserved in YAML)
+    - Wikilink reconstruction ([[id]] format for link fields)
+    - id exclusion (derived from filename, never stored in YAML)
+    - None → empty string (avoids 'null' in YAML, cleaner for Obsidian)
+    """
+    # by_alias=True: credebility, umprella_problem preserved as YAML keys
+    # exclude id: derived from filename, not YAML data
+    data = note.model_dump(by_alias=True, exclude={"id"})
+
+    # Reconstruct wikilinks: bare IDs → [[id]]
+    for key in _WIKILINK_YAML_KEYS:
+        if key in data and isinstance(data[key], list):
+            data[key] = [f"[[{v}]]" for v in data[key] if v]
+
+    # Pipeline-managed fields: remove from YAML entirely if not yet set.
+    # These only appear once the pipeline has actually computed them.
+    _PIPELINE_FIELDS = {
+        "score", "score_breakdown", "score_version", "scored_at", "research_fidelity",
+    }
+    for key in _PIPELINE_FIELDS:
+        if key in data and (data[key] is None or data[key] == "" or data[key] == {}):
+            del data[key]
+
+    # Remaining None values → empty string for cleaner YAML
+    # (Obsidian prefers `field: ` over `field: null`)
+    for key, value in list(data.items()):
+        if value is None:
+            data[key] = ""
+
+    return data
+
+
+def write_note(vault_note: VaultNote) -> None:
+    """Write a note atomically: temp file → rename.
+
+    The rename operation is atomic on Linux (POSIX guarantee).
+    Either the old file is fully intact, or the new file is fully written.
+    Never a half-written state.
+
+    The body (markdown below frontmatter) is preserved as-is.
+    """
+    yaml_data = _to_yaml_dict(vault_note.model)
+    post = frontmatter.Post(vault_note.body, **yaml_data)
+
+    # Serialize to string first (avoids bytes vs str issues with yaml dumper)
+    content = frontmatter.dumps(post, default_flow_style=False, allow_unicode=True)
+
+    # Write to temp file in the SAME directory (important: rename is only
+    # atomic within the same filesystem/mount point)
+    parent = vault_note.path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path_str = tempfile.mkstemp(
+        suffix=".md.tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_path_str)
+
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        # Atomic rename
+        tmp_path.rename(vault_note.path)
+    except Exception:
+        # Clean up temp file on failure
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# List
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ListResult:
+    """Result of listing notes in a vault directory."""
+
+    notes: list[VaultNote] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)  # (filename, reason)
+    errors: list[tuple[str, str]] = field(default_factory=list)  # (filename, error_msg)
+
+
+def list_notes(
+    vault_path: Path,
+    note_type: Optional[type[BaseNote]] = None,
+) -> ListResult:
+    """List all valid notes in a vault directory (flat, non-recursive).
+
+    Args:
+        vault_path: path to the vault root
+        note_type: optional filter (IdeeNote, ChanceNote, WissenNote).
+                   None = return all recognized notes.
+
+    Returns:
+        ListResult with notes, skipped files, and error files.
+    """
+    result = ListResult()
+
+    if not vault_path.is_dir():
+        raise NotADirectoryError(f"Not a directory: {vault_path}")
+
+    for md_file in sorted(vault_path.glob("*.md")):
+        try:
+            vnote = read_note(md_file)
+        except ValueError as e:
+            # Unrecognized type (no database field, etc.)
+            result.skipped.append((md_file.name, str(e)))
+            continue
+        except ValidationError as e:
+            # Schema validation failure
+            first_err = e.errors()[0]
+            loc = ".".join(str(p) for p in first_err["loc"])
+            result.errors.append((md_file.name, f"{loc}: {first_err['msg']}"))
+            continue
+        except Exception as e:
+            result.errors.append((md_file.name, str(e)))
+            continue
+
+        # Type filter
+        if note_type is not None and not isinstance(vnote.model, note_type):
+            continue
+
+        result.notes.append(vnote)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Data quality checks (vault doctor)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DoctorFinding:
+    """One data quality issue found by the vault doctor."""
+
+    severity: str  # "error" | "warning" | "info"
+    file: str  # filename
+    message: str
+
+
+def check_vault_health(vault_path: Path) -> list[DoctorFinding]:
+    """Run data quality checks across the entire vault.
+
+    Checks:
+    1. Broken links: wikilinks pointing to nonexistent files
+    2. Empty descriptions: notes without meaningful descriptions
+    3. Unscored notes: all score fields at default (6)
+    4. Untyped files: .md files that can't be classified
+    """
+    findings: list[DoctorFinding] = []
+
+    # First: build a set of all known note IDs (filenames without .md)
+    all_ids = {f.stem for f in vault_path.glob("*.md")}
+
+    # Read all notes
+    lr = list_notes(vault_path)
+
+    # Report errors from reading
+    for filename, error in lr.errors:
+        findings.append(DoctorFinding("error", filename, f"Parse error: {error}"))
+
+    # Report untyped files
+    for filename, reason in lr.skipped:
+        findings.append(DoctorFinding("warning", filename, "Unknown type (no database field)"))
+
+    for vnote in lr.notes:
+        model = vnote.model
+        fname = vnote.path.name
+
+        # Check 1: Broken links
+        _check_broken_links(model, fname, all_ids, findings)
+
+        # Check 2: Empty descriptions
+        desc = getattr(model, "description", None)
+        if not desc or (isinstance(desc, str) and desc.strip() in ("", "...")):
+            findings.append(DoctorFinding("info", fname, "No description"))
+
+        # Check 3: Unscored notes (all scores at default 6)
+        _check_unscored(model, fname, findings)
+
+    return findings
+
+
+def _check_broken_links(
+    model: BaseNote, fname: str, all_ids: set[str], findings: list[DoctorFinding]
+) -> None:
+    """Check wikilink fields for references to nonexistent notes."""
+    link_fields: list[tuple[str, list[str]]] = []
+
+    if isinstance(model, IdeeNote):
+        link_fields.append(("chancen", model.chancen))
+        link_fields.append(("wissen", model.wissen))
+    elif isinstance(model, ChanceNote):
+        link_fields.append(("umprella_problem", model.umbrella_problem))
+
+    for field_name, linked_ids in link_fields:
+        for linked_id in linked_ids:
+            if linked_id not in all_ids:
+                findings.append(DoctorFinding(
+                    "warning",
+                    fname,
+                    f"Broken link in {field_name}: [[{linked_id}]] "
+                    f"(no file '{linked_id}.md' in vault)"
+                ))
+
+
+def _check_unscored(model: BaseNote, fname: str, findings: list[DoctorFinding]) -> None:
+    """Check if all score fields are still at default value (6 = worst)."""
+    score_fields: list[str] = []
+
+    if isinstance(model, IdeeNote):
+        score_fields = [
+            "market_size", "market_potential", "impact",
+            "difficulty", "time_investment", "innovativeness",
+        ]
+    elif isinstance(model, ChanceNote):
+        score_fields = [
+            "granularitaet", "urgency", "prevalence",
+            "impact", "personal_experience", "market_awareness",
+        ]
+    elif isinstance(model, WissenNote):
+        score_fields = ["enjoyment", "confidence", "credibility", "contacts"]
+
+    if not score_fields:
+        return
+
+    values = [getattr(model, f, 6) for f in score_fields]
+    if all(v == 6 for v in values):
+        findings.append(DoctorFinding(
+            "info", fname, "All scores at default (6) — not yet rated"
+        ))
+
+
+---
+src/idea_pipeline/research/__init__.py
+---
+"""Research layer: fetch external data to fill in market_size, prevalence, etc.
+
+Tier-based funnel (set in Step 6-8):
+- T0: vault only, no research
+- T1: web search (Claude API)
+- T2: web + structured sources (Statista, Destatis, Eurostat)
+- T3: + reports, deep competitor analysis
+"""
+
+
+---
+src/idea_pipeline/research/cache.py
+---
+"""SQLite cache for research results.
+
+Key: sha256(query + "|" + source_name)
+Value: raw response JSON + timestamp
+TTL: 7 days
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+_TTL_SECONDS = 7 * 24 * 3600
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+_DB_PATH = _PROJECT_ROOT / "cache" / "research.db"
+
+_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS research_cache (
+    key        TEXT PRIMARY KEY,
+    source     TEXT NOT NULL,
+    query      TEXT NOT NULL,
+    response   TEXT NOT NULL,
+    created_at REAL NOT NULL
+)
+"""
+
+
+def _cache_key(query: str, source: str) -> str:
+    return hashlib.sha256(f"{query}|{source}".encode()).hexdigest()
+
+
+def _connect() -> sqlite3.Connection:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_DB_PATH)
+    conn.execute(_CREATE_SQL)
+    conn.commit()
+    return conn
+
+
+def cache_get(query: str, source: str) -> Optional[Any]:
+    """Return cached response or None if missing/expired."""
+    key = _cache_key(query, source)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT response, created_at FROM research_cache WHERE key = ?", (key,)
+        ).fetchone()
+    if row is None:
+        return None
+    response_json, created_at = row
+    if time.time() - created_at > _TTL_SECONDS:
+        return None
+    return json.loads(response_json)
+
+
+def cache_set(query: str, source: str, response: Any) -> None:
+    """Store response in cache."""
+    key = _cache_key(query, source)
+    with _connect() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO research_cache (key, source, query, response, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (key, source, query, json.dumps(response, ensure_ascii=False), time.time()),
+        )
+        conn.commit()
+
+
+def cache_stats() -> dict:
+    """Return {total, expired} entry counts for diagnostics."""
+    with _connect() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM research_cache").fetchone()[0]
+        expired = conn.execute(
+            "SELECT COUNT(*) FROM research_cache WHERE created_at < ?",
+            (time.time() - _TTL_SECONDS,),
+        ).fetchone()[0]
+    return {"total": total, "expired": expired}
+
+
+---
+src/idea_pipeline/research/web.py
+---
+"""Research dispatcher — maps tier number to the right source adapter.
+
+T1 = TavilyResearcher        (snippets, scores only)
+T2 = ClaudeSearchResearcher  (Claude + web_search, scores + narrative)
+T3 = PerplexityResearcher    (sonar-pro, scores + narrative)
+T4 = FirecrawlResearcher     (full-page scrape, scores + narrative, top 5 only)
+T5 = AutoResearcher          (3-loop autonomous research, research_notes only)
+"""
+from __future__ import annotations
+
+from idea_pipeline.research.sources.autoresearch import AutoResearcher
+from idea_pipeline.research.sources.base import RESEARCH_FIELDS, tier_level
+from idea_pipeline.research.sources.claude_search import ClaudeSearchResearcher
+from idea_pipeline.research.sources.firecrawl import MIN_CREDITS, FirecrawlResearcher
+from idea_pipeline.research.sources.perplexity import PerplexityResearcher
+from idea_pipeline.research.sources.tavily import TavilyResearcher
+
+_RESEARCHERS = {
+    1: TavilyResearcher,
+    2: ClaudeSearchResearcher,
+    3: PerplexityResearcher,
+    4: FirecrawlResearcher,
+    5: AutoResearcher,
+}
+
+TIER_LIMITS = {1: None, 2: 50, 3: 10, 4: 5, 5: 5}
+
+
+def get_researcher(tier: int):
+    cls = _RESEARCHERS.get(tier)
+    if cls is None:
+        raise ValueError(f"Unknown research tier: {tier}")
+    return cls()
+
+
+__all__ = [
+    "get_researcher",
+    "tier_level",
+    "TIER_LIMITS",
+    "RESEARCH_FIELDS",
+    "MIN_CREDITS",
+    # backward-compat exports
+    "TavilyResearcher",
+    "ClaudeSearchResearcher",
+    "PerplexityResearcher",
+    "FirecrawlResearcher",
+    "AutoResearcher",
+]
+
+
+---
+src/idea_pipeline/research/sources/__init__.py
+---
+from idea_pipeline.research.sources.autoresearch import AutoResearcher
+from idea_pipeline.research.sources.claude_search import ClaudeSearchResearcher
+from idea_pipeline.research.sources.firecrawl import FirecrawlResearcher
+from idea_pipeline.research.sources.perplexity import PerplexityResearcher
+from idea_pipeline.research.sources.tavily import TavilyResearcher
+
+__all__ = [
+    "TavilyResearcher",
+    "ClaudeSearchResearcher",
+    "PerplexityResearcher",
+    "FirecrawlResearcher",
+    "AutoResearcher",
+]
+
+
+---
+src/idea_pipeline/research/sources/autoresearch.py
+---
+"""T5: Autonomous research loop — 3 focused multi-turn Claude+web_search loops per idea.
+
+Note: Originally spec'd around karpathy/autoresearch, but that repo doesn't exist publicly.
+This implements the same concept natively: multi-iteration Claude loops with stop-tool.
+Each loop targets a specific angle; results written to vault under research_notes + markdown file.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Optional
+
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import get_anthropic, read_prompt
+
+_SONNET = "claude-sonnet-4-6"
+_MAX_ITER = 5
+
+_LOOPS = [
+    {
+        "name": "counterarguments",
+        "question": "Was sind die stärksten Gründe warum diese Idee scheitert? Fokus auf Markt-Realität, nicht Theorie.",
+    },
+    {
+        "name": "competitors",
+        "question": "Finde 3 direkte Konkurrenten mit konkreten Umsatzzahlen oder Funding-Runden. Nenne URLs.",
+    },
+    {
+        "name": "barriers",
+        "question": "Welche regulatorischen, technischen oder Go-to-Market-Barrieren existieren konkret für diesen Markt?",
+    },
+]
+
+_STOP_TOOL = {
+    "name": "research_complete",
+    "description": "Call when you have enough information to answer the question thoroughly.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "findings": {"type": "string", "description": "Complete findings in markdown"},
+        },
+        "required": ["findings"],
+    },
+}
+
+
+class AutoResearcher:
+    SOURCE = "autoresearch_v1"
+    FIDELITY = "tier5"
+
+    def __init__(self):
+        self._llm = get_anthropic()
+        self._system = read_prompt("research_t5_loop.txt")
+
+    def research_idea(
+        self, idea_id: str, description: str, existing_context: str = ""
+    ) -> tuple[dict, str, str]:
+        """Return (scores={}, research_notes_markdown, raw_json_for_cache).
+
+        T5 doesn't update market scores — it adds qualitative research_notes.
+        """
+        cache_key = f"t5:{idea_id}"
+        cached = cache_get(cache_key, self.SOURCE)
+        if cached:
+            return {}, cached.get("research_notes", ""), ""
+
+        results: dict[str, str] = {}
+        for loop in _LOOPS:
+            findings = self._run_loop(
+                loop["name"], loop["question"], description, existing_context
+            )
+            results[loop["name"]] = findings
+
+        research_notes = self._format_notes(idea_id, description, results)
+        cache_set(cache_key, self.SOURCE, {"research_notes": research_notes})
+        return {}, research_notes, json.dumps(results, ensure_ascii=False)
+
+    def _run_loop(
+        self, loop_name: str, question: str, description: str, context: str
+    ) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"Business idea: {description[:400]}\n\n"
+                    + (f"Existing research context:\n{context[:800]}\n\n" if context else "")
+                    + f"Research question: {question}"
+                ),
+            }
+        ]
+        for _ in range(_MAX_ITER):
+            try:
+                resp = self._llm.messages.create(
+                    model=_SONNET,
+                    max_tokens=2048,
+                    system=self._system,
+                    tools=[
+                        {"type": "web_search_20250305", "name": "web_search"},
+                        _STOP_TOOL,
+                    ],
+                    messages=messages,
+                )
+            except Exception:
+                break
+
+            # Check for research_complete tool call
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use" and block.name == "research_complete":
+                    return block.input.get("findings", "")
+
+            if resp.stop_reason == "end_turn":
+                text = next(
+                    (b.text for b in resp.content if hasattr(b, "text")), ""
+                )
+                return text
+
+            # Continue loop
+            messages.append({"role": "assistant", "content": resp.content})
+            messages.append({
+                "role": "user",
+                "content": "Continue if you need more information, or call research_complete.",
+            })
+
+        return "(no findings)"
+
+    def _format_notes(self, idea_id: str, description: str, results: dict[str, str]) -> str:
+        lines = [
+            f"# T5 Research Notes: {idea_id}\n",
+            f"> {description[:200]}\n",
+            "---\n",
+        ]
+        labels = {
+            "counterarguments": "## Gegenargumente / Risiken",
+            "competitors":      "## Wettbewerber",
+            "barriers":         "## Markteintrittsbarrieren",
+        }
+        for key, heading in labels.items():
+            lines.append(heading)
+            lines.append(results.get(key, "(keine Ergebnisse)"))
+            lines.append("")
+        return "\n".join(lines)
+
+
+---
+src/idea_pipeline/research/sources/base.py
+---
+"""Shared constants and utilities for all research source adapters."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+PROMPTS_DIR = _PROJECT_ROOT / "config" / "prompts" / "v1"
+
+RESEARCH_FIELDS = ["market_size", "market_potential", "prevalence", "market_awareness"]
+
+_TIER_ORDER = {"tier1": 1, "tier2": 2, "tier3": 3, "tier4": 4, "tier5": 5}
+
+
+def tier_level(fidelity: str | None) -> int:
+    return _TIER_ORDER.get(fidelity or "", 0)
+
+
+def read_prompt(name: str) -> str:
+    return (PROMPTS_DIR / name).read_text(encoding="utf-8")
+
+
+def parse_json(text: str) -> Any:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return json.loads(text)
+
+
+def get_anthropic():
+    from anthropic import Anthropic
+    return Anthropic()
+
+
+def clamp(v: Any) -> int:
+    return max(1, min(6, int(v)))
+
+
+---
+src/idea_pipeline/research/sources/claude_search.py
+---
+"""T2: Claude Sonnet + web_search tool — scores + founder narrative."""
+from __future__ import annotations
+
+import json
+from typing import Optional
+
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import (
+    RESEARCH_FIELDS,
+    clamp,
+    get_anthropic,
+    parse_json,
+    read_prompt,
+)
+
+_SONNET = "claude-sonnet-4-6"
+
+
+class ClaudeSearchResearcher:
+    SOURCE = "claude_search_v1"
+    FIDELITY = "tier2"
+
+    def __init__(self):
+        self._llm = get_anthropic()
+        self._prompt = read_prompt("research_t2_claude_search.txt")
+
+    def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, Optional[int]], str]:
+        cache_key = f"t2:{idea_id}"
+        cached = cache_get(cache_key, self.SOURCE)
+        if cached:
+            scores = {f: cached[f] for f in RESEARCH_FIELDS if cached.get(f) is not None}
+            return scores, cached.get("narrative", "")
+
+        user_msg = json.dumps({"idea_description": description[:600]}, ensure_ascii=False)
+        try:
+            resp = self._llm.messages.create(
+                model=_SONNET,
+                max_tokens=2048,
+                system=self._prompt,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            text = next(
+                (block.text for block in reversed(resp.content) if hasattr(block, "text")),
+                "",
+            )
+            data = parse_json(text)
+        except Exception:
+            return {}, ""
+
+        scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
+        narrative = data.get("narrative", "")
+        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        return scores, narrative
+
+
+---
+src/idea_pipeline/research/sources/firecrawl.py
+---
+"""T4: Firecrawl — full-page scrape of market research sources, top 5 only."""
+from __future__ import annotations
+
+import json
+import os
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import (
+    RESEARCH_FIELDS,
+    clamp,
+    get_anthropic,
+    parse_json,
+    read_prompt,
+)
+
+load_dotenv()
+
+_SONNET = "claude-sonnet-4-6"
+_FC_SEARCH_SOURCE = "firecrawl_v2_search"
+MIN_CREDITS = 20
+
+
+class FirecrawlResearcher:
+    SOURCE = "firecrawl_v2"
+    FIDELITY = "tier4"
+
+    def __init__(self):
+        from firecrawl import FirecrawlApp
+        fc_key = os.environ.get("FIRECRAWL_API_KEY", "")
+        if not fc_key or fc_key.startswith("fc-..."):
+            raise RuntimeError("FIRECRAWL_API_KEY not set in .env")
+        self._fc = FirecrawlApp(api_key=fc_key)
+        self._llm = get_anthropic()
+        self._prompt = read_prompt("research_t2_extract_v2.txt")
+
+    def remaining_credits(self) -> int:
+        try:
+            return self._fc.get_credit_usage().remaining_credits or 0
+        except Exception:
+            return 9999
+
+    def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, Optional[int]], str]:
+        cache_key = f"t4:{idea_id}"
+        cached = cache_get(cache_key, self.SOURCE)
+        if cached:
+            scores = {f: cached[f] for f in RESEARCH_FIELDS if cached.get(f) is not None}
+            return scores, cached.get("narrative", "")
+
+        urls_with_snippets = self._search_urls(description)
+        if not urls_with_snippets:
+            return {}, ""
+
+        sections: list[str] = []
+        scraped_urls: list[str] = []
+        for url, snippet in urls_with_snippets[:2]:
+            md = self._scrape(url)
+            if md:
+                sections.append(f"### {url}\n\n{md[:5000]}")
+                scraped_urls.append(url)
+            elif snippet:
+                sections.append(f"### {url}\n\n{snippet}")
+                scraped_urls.append(url)
+
+        if not sections:
+            return {}, ""
+
+        scores, narrative = self._extract(description, "\n\n---\n\n".join(sections), scraped_urls)
+        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        return scores, narrative
+
+    def _search_urls(self, description: str) -> list[tuple[str, str]]:
+        query = f"{description[:180]} global market size revenue statistics"
+        cached = cache_get(query, _FC_SEARCH_SOURCE)
+        if cached:
+            return [(r["url"], r.get("description", "")) for r in cached.get("results", [])]
+        try:
+            result = self._fc.search(query, limit=5)
+            results = [
+                {"url": item.url, "description": item.description or ""}
+                for item in (result.web or [])
+                if getattr(item, "url", None)
+            ]
+        except Exception:
+            results = []
+        cache_set(query, _FC_SEARCH_SOURCE, {"results": results})
+        return [(r["url"], r["description"]) for r in results]
+
+    def _scrape(self, url: str) -> Optional[str]:
+        cached = cache_get(url, self.SOURCE)
+        if cached:
+            return cached.get("markdown")
+        try:
+            result = self._fc.scrape(url, formats=["markdown"])
+            markdown = (result.markdown or "")[:8000] if hasattr(result, "markdown") else ""
+        except Exception:
+            markdown = None
+        cache_set(url, self.SOURCE, {"markdown": markdown})
+        return markdown or None
+
+    def _extract(self, description: str, combined_md: str, sources: list[str]) -> tuple[dict, str]:
+        payload = {
+            "idea_description": description[:400],
+            "combined_markdown": combined_md,
+            "source_urls": sources,
+        }
+        try:
+            resp = self._llm.messages.create(
+                model=_SONNET,
+                max_tokens=1024,
+                system=self._prompt,
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            )
+            data = parse_json(resp.content[0].text)
+        except Exception:
+            return {}, ""
+        scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
+        return scores, data.get("narrative", "")
+
+
+---
+src/idea_pipeline/research/sources/perplexity.py
+---
+"""T3: Perplexity sonar-pro — deep web research via OpenAI-compatible endpoint."""
+from __future__ import annotations
+
+import json
+import os
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import (
+    RESEARCH_FIELDS,
+    clamp,
+    parse_json,
+    read_prompt,
+)
+
+load_dotenv()
+
+_PERPLEXITY_BASE = "https://api.perplexity.ai"
+_MODEL = "sonar-pro"
+
+
+class PerplexityResearcher:
+    SOURCE = "perplexity_v1"
+    FIDELITY = "tier3"
+
+    def __init__(self):
+        from openai import OpenAI
+        api_key = os.environ.get("PERPLEXITY_API_KEY", "")
+        if not api_key or api_key.startswith("pplx-..."):
+            raise RuntimeError(
+                "PERPLEXITY_API_KEY not set in .env — "
+                "get a key at https://www.perplexity.ai/settings/api"
+            )
+        self._client = OpenAI(api_key=api_key, base_url=_PERPLEXITY_BASE)
+        self._prompt = read_prompt("research_t3_perplexity.txt")
+
+    def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, Optional[int]], str]:
+        cache_key = f"t3:{idea_id}"
+        cached = cache_get(cache_key, self.SOURCE)
+        if cached:
+            scores = {f: cached[f] for f in RESEARCH_FIELDS if cached.get(f) is not None}
+            return scores, cached.get("narrative", "")
+
+        user_msg = json.dumps({"idea_description": description[:600]}, ensure_ascii=False)
+        try:
+            resp = self._client.chat.completions.create(
+                model=_MODEL,
+                messages=[
+                    {"role": "system", "content": self._prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=2048,
+            )
+            text = resp.choices[0].message.content or ""
+            data = parse_json(text)
+        except Exception as e:
+            raise RuntimeError(f"Perplexity API error: {e}") from e
+
+        scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
+        narrative = data.get("narrative", "")
+        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        return scores, narrative
+
+
+---
+src/idea_pipeline/research/sources/tavily.py
+---
+"""T1: Tavily — fast snippet-based market scoring (4 queries per idea)."""
+from __future__ import annotations
+
+import json
+import os
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import (
+    RESEARCH_FIELDS,
+    clamp,
+    get_anthropic,
+    parse_json,
+    read_prompt,
+)
+
+load_dotenv()
+
+_HAIKU = "claude-haiku-4-5-20251001"
+
+_QUERY_TEMPLATES = {
+    "market_size":      "{description} market size global annual revenue",
+    "market_potential": "{description} market growth rate CAGR forecast",
+    "prevalence":       "{description} problem frequency how many people affected statistics",
+    "market_awareness": "{description} consumer awareness adoption rate survey",
+}
+
+
+class TavilyResearcher:
+    SOURCE = "tavily_v1"
+    FIDELITY = "tier1"
+
+    def __init__(self):
+        from tavily import TavilyClient
+        api_key = os.environ.get("TAVILY_API_KEY", "")
+        if not api_key or api_key.startswith("tvly-..."):
+            raise RuntimeError("TAVILY_API_KEY not set in .env")
+        self._client = TavilyClient(api_key=api_key)
+        self._llm = get_anthropic()
+        self._prompt = read_prompt("research_t1_extract.txt")
+
+    def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, int], str]:
+        scores = {
+            field: self._score_field(
+                field, description,
+                _QUERY_TEMPLATES[field].format(description=description[:200])
+            )
+            for field in RESEARCH_FIELDS
+        }
+        return scores, ""
+
+    def _score_field(self, field: str, description: str, query: str) -> int:
+        cached = cache_get(query, self.SOURCE)
+        if cached is not None:
+            return cached.get("score", 4)
+
+        try:
+            results = self._client.search(query=query, search_depth="basic", max_results=5)
+            snippets = [
+                {
+                    "title": r.get("title", ""),
+                    "content": r.get("content", "")[:500],
+                    "url": r.get("url", ""),
+                }
+                for r in results.get("results", [])
+            ]
+        except Exception:
+            return 4
+
+        payload = {
+            "idea_description": description[:300],
+            "field": field,
+            "search_results": snippets,
+        }
+        try:
+            resp = self._llm.messages.create(
+                model=_HAIKU,
+                max_tokens=256,
+                system=self._prompt,
+                messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            )
+            score = clamp(parse_json(resp.content[0].text)["score"])
+        except Exception:
+            score = 4
+
+        cache_set(query, self.SOURCE, {"score": score, "snippets": snippets})
+        return score
+
+
+---
+config/prompts/v1/enrich_chances.txt
+---
+You are enriching a business idea validation pipeline's knowledge base.
+
+Given a list of "Chance" (problem/opportunity) items, write a concise 1-2 sentence description for each.
+A Chance represents a real-world problem, pain point, or market gap that a business idea could address.
+
+Input: JSON list of {"id": "...", "name": "...", "linked_ideas": ["..."]}
+Output: JSON list of {"id": "...", "description": "..."}
+
+Rules:
+- 1-2 sentences (max 200 characters total)
+- Match the language of the name/context (English or German)
+- Describe: what the problem is, who faces it, why it matters — no marketing fluff
+- Use the linked_ideas as context clues if the name alone is ambiguous
+- Output ONLY valid JSON — no explanation, no markdown fences
+
+
+---
+config/prompts/v1/generate_chances.txt
+---
+You analyze a business idea description and identify the underlying problem spaces (Chancen) it addresses.
+
+Input: JSON object with {"idea_id": "...", "idea_description": "...", "existing_chances": [{"id": "...", "description": "..."}]}
+Output: JSON object with {"linked_existing": ["id1", ...], "new_chances": [{"id": "...", "description": "..."}]}
+
+Rules:
+- Identify 3-6 relevant problem spaces total
+- Prefer linking to existing chances over creating new ones — only create new if no existing chance matches well
+- New chance IDs: snake_case, English, descriptive (e.g. "high_protein_demand", "urban_space_constraints")
+- New chance descriptions: 1-2 sentences, what problem exists and who has it
+- Do not duplicate existing chance IDs
+- Output ONLY valid JSON — no explanation, no markdown fences
+
+
+---
+config/prompts/v1/link_wissen.txt
+---
+You match business ideas to relevant personal knowledge areas (Wissen).
+
+Input: JSON object with:
+  - "ideas": list of {"id": "...", "description": "..."}
+  - "wissen": list of {"id": "...", "description": "..."}
+
+Output: JSON list of {"idea_id": "...", "wissen_ids": ["id1", "id2", ...]}
+
+Rules:
+- For each idea, select 1-5 wissen areas that are directly relevant
+- Only include wissen where the person's knowledge/contacts genuinely help build or sell this idea
+- Prefer quality over quantity — if only 1 wissen area truly fits, return just 1
+- Use the exact wissen IDs from the input list
+- Omit ideas where no wissen area is relevant (do not emit {"idea_id": "...", "wissen_ids": []})
+- Output ONLY valid JSON list — no explanation, no markdown fences
+
+
+---
+config/prompts/v1/research_t1_extract.txt
+---
+You extract market intelligence scores from web search results for a business idea.
+
+Input: JSON object with:
+  - "idea_description": string
+  - "field": one of "market_size" | "market_potential" | "prevalence" | "market_awareness"
+  - "search_results": list of {"title": "...", "content": "...", "url": "..."}
+
+Output: JSON object with:
+  - "score": integer 1-6
+  - "reasoning": one sentence
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=very large global market (>$10B), 6=very niche (<$10M)
+  market_potential:  1=fast growing (>20%/yr), 6=shrinking or stagnant
+  prevalence:        1=very widespread problem (millions affected), 6=rare edge case
+  market_awareness:  1=well-known established problem, 6=unknown, needs heavy education
+
+If results are insufficient to judge, return score 4 (conservative default).
+Output ONLY valid JSON — no explanation, no markdown fences.
+
+
+---
+config/prompts/v1/research_t2_claude_search.txt
+---
+You are a market intelligence analyst. Use your web_search tool to research the business idea and return structured JSON.
+
+Run exactly 3 searches covering:
+1. Global market size + annual revenue figures
+2. Key competitors + their market position / funding
+3. Regulatory landscape + major growth trends / CAGR
+
+Then output a single JSON object (no markdown fences, no other text) with:
+  - "market_size": integer 1-6 or null
+  - "market_potential": integer 1-6 or null
+  - "prevalence": integer 1-6 or null
+  - "market_awareness": integer 1-6 or null
+  - "narrative": string — 4-6 sentences for a founder evaluating this idea. Must include: concrete $ market size, CAGR %, named competitors, top risk, key tailwind.
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=>$10B global, 6=<$10M niche
+  market_potential:  1=>20% CAGR, 6=shrinking/stagnant
+  prevalence:        1=millions affected, 6=rare edge case
+  market_awareness:  1=well-known problem, 6=unknown, needs education
+
+Only score fields with concrete evidence. Return null if genuinely uncertain.
+Output ONLY valid JSON as your final message.
+
+
+---
+config/prompts/v1/research_t2_claude_ws.txt
+---
+You are a market intelligence analyst. Use your web search tool to research the business idea provided and return structured scores + a founder-focused narrative.
+
+Input: JSON with "idea_description" (string).
+
+Steps:
+1. Run 2–3 targeted web searches covering: global market size, growth rate/CAGR, problem prevalence, and consumer/industry awareness.
+2. Synthesize what you find into the output JSON below.
+
+Output: a single JSON object (no markdown fences) with:
+  - "market_size": integer 1-6 or null
+  - "market_potential": integer 1-6 or null
+  - "prevalence": integer 1-6 or null
+  - "market_awareness": integer 1-6 or null
+  - "narrative": string — 4-6 sentences for a founder deciding whether to pursue this idea. Include: concrete market size figures ($), CAGR %, key incumbents, main risks, and 1-2 notable tailwinds or headwinds.
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=very large global market (>$10B), 6=very niche (<$10M)
+  market_potential:  1=fast growing (>20%/yr CAGR), 6=shrinking or stagnant
+  prevalence:        1=very widespread problem (millions affected), 6=rare edge case
+  market_awareness:  1=well-known established problem, 6=unknown, needs heavy education
+
+Rules:
+- Only score fields where you found concrete data; return null if genuinely uncertain
+- The narrative must cite actual numbers from your searches
+- Output ONLY valid JSON as your final message — no other text
+
+
+---
+config/prompts/v1/research_t2_extract.txt
+---
+You extract market intelligence scores from structured data sources (Destatis, Eurostat, Statista).
+
+Input: JSON object with:
+  - "idea_description": string
+  - "scraped_markdown": string (page content from official statistical source)
+  - "source_url": string
+
+Output: JSON object with:
+  - "market_size": integer 1-6 or null (if not determinable)
+  - "market_potential": integer 1-6 or null
+  - "prevalence": integer 1-6 or null
+  - "market_awareness": integer 1-6 or null
+  - "reasoning": one sentence per non-null field as a dict
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=very large global market (>$10B), 6=very niche (<$10M)
+  market_potential:  1=fast growing (>20%/yr), 6=shrinking or stagnant
+  prevalence:        1=very widespread problem (millions affected), 6=rare edge case
+  market_awareness:  1=well-known established problem, 6=unknown, needs education
+
+Only score fields where the scraped content provides clear evidence.
+Output ONLY valid JSON — no explanation, no markdown fences.
+
+
+---
+config/prompts/v1/research_t2_extract_v2.txt
+---
+You are a market intelligence analyst. Extract scores and a concise narrative from scraped market research pages.
+
+Input: JSON object with:
+  - "idea_description": string
+  - "combined_markdown": string (scraped content from 1-2 market research pages)
+  - "source_urls": list of strings
+
+Output: JSON object with:
+  - "market_size": integer 1-6 or null
+  - "market_potential": integer 1-6 or null
+  - "prevalence": integer 1-6 or null
+  - "market_awareness": integer 1-6 or null
+  - "narrative": string (3-5 sentences: key market facts, concrete numbers, growth rates, notable players, risks — focused on what matters for a founder deciding whether to pursue this idea)
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=very large global market (>$10B), 6=very niche (<$10M)
+  market_potential:  1=fast growing (>20%/yr CAGR), 6=shrinking or stagnant
+  prevalence:        1=very widespread problem (millions affected), 6=rare edge case
+  market_awareness:  1=well-known established problem, 6=unknown, needs education
+
+Rules:
+- Only score fields where the content provides clear evidence with numbers or data
+- The narrative must cite concrete figures from the sources (market size in $, CAGR %, etc.)
+- If sources are off-topic or too vague, return null scores and say so in narrative
+- Output ONLY valid JSON — no explanation, no markdown fences
+
+
+---
+config/prompts/v1/research_t3_perplexity.txt
+---
+You are a market intelligence analyst with access to current web data. Research the business idea provided and return structured JSON.
+
+Cover these angles in your research:
+1. Global market size + revenue figures with sources
+2. Market growth rate / CAGR + forecast horizon
+3. Problem prevalence — how many people / companies are affected
+4. Market maturity — is this a known problem or does it need evangelism?
+5. Key competitors with funding or revenue data
+
+Output a single JSON object (no markdown fences, no other text) with:
+  - "market_size": integer 1-6 or null
+  - "market_potential": integer 1-6 or null
+  - "prevalence": integer 1-6 or null
+  - "market_awareness": integer 1-6 or null
+  - "narrative": string — 5-7 sentences for a founder. Must include: $ market size, CAGR %, named players, barriers to entry, key opportunity or risk.
+
+Score meaning (1=best, 6=worst):
+  market_size:       1=>$10B global, 6=<$10M niche
+  market_potential:  1=>20% CAGR, 6=shrinking/stagnant
+  prevalence:        1=millions affected, 6=rare edge case
+  market_awareness:  1=well-known problem, 6=unknown, needs education
+
+Cite sources inline in the narrative where possible. Output ONLY valid JSON.
+
+
+---
+config/prompts/v1/research_t5_loop.txt
+---
+You are a brutally honest startup research analyst. Your job is to answer one focused research question about a business idea using web search.
+
+Rules:
+- Search until you have concrete, specific information (names, numbers, URLs)
+- Prefer primary sources: company websites, regulatory bodies, market reports
+- When you have enough for a thorough answer, call the research_complete tool
+- Be skeptical. Identify real obstacles, not theoretical ones.
+- Write findings in German or English, whichever fits the sources better
+- Include specific figures, names, and URLs wherever possible
+
+
+---
+config/prompts/v1/umbrella_links.txt
+---
+You organize a hierarchy of "Chance" (problem/opportunity) items by identifying which specific problems are sub-problems of broader ones.
+
+Input: JSON list of all chances with {"id": "...", "description": "..."}
+Output: JSON list of {"id": "...", "umbrella_ids": ["broad_chance_id"]} — only for chances that ARE sub-problems.
+
+Rules:
+- Only assign umbrella links where there is a clear hierarchical relationship (specific → broad)
+- The umbrella ID must exist in the input list
+- A chance can have at most 1-2 umbrella problems
+- Broad/root problems (e.g. "human_health", "ecological_stability") should NOT get umbrella links
+- Omit entries where no umbrella applies — do not emit {"id": "...", "umbrella_ids": []}
+- Output ONLY valid JSON list — no explanation, no markdown fences
+
+
+---
+pyproject.toml
+---
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "idea-pipeline"
+version = "0.1.0"
+description = "Business idea validation & generation pipeline based on an Obsidian vault"
+requires-python = ">=3.11"
+dependencies = [
+    # LLM
+    "anthropic>=0.39.0",
+    "python-dotenv>=1.0.0",
+    # Research
+    "tavily-python>=0.3.0",
+    "firecrawl-py>=1.0.0",\n    "openai>=1.0.0",
+    # Vault I/O
+    "python-frontmatter>=1.1.0",
+    # Data validation & modeling
+    "pydantic>=2.5.0",
+    "pyyaml>=6.0",
+    # Scoring & data manipulation
+    "pandas>=2.1.0",
+    # CLI
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+# Registers the `ideapipe` command system-wide once installed.
+# This is what you (and later: Claude via MCP) will call.
+ideapipe = "idea_pipeline.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/idea_pipeline"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+
+---
+VALIDATION_STATUS.md
+---
+# Idea Pipeline — Validation Status
+
+> **Zweck dieses Dokuments:** Gesprächsgrundlage für eine Evaluation des bisherigen Stands.
+> Enthält den aktuellen Datenstand, die Pipeline-Architektur, bekannte Schwachstellen und offene Fragen.
+> Erstellt: 2026-04-19
+
+---
+
+## Was wurde bisher gebaut?
+
+Eine automatisierte Bewertungspipeline für Geschäftsideen, die in einem Obsidian-Vault als Markdown-Dateien gespeichert sind. Die Pipeline läuft auf einem Server und ist über dieses Git-Repo zugänglich.
+
+### Datenstruktur
+
+Der Vault enthält drei Note-Typen:
+- **IdeeNote** — eine Geschäftsidee (142 Stück)
+- **ChanceNote** — ein Problem/Opportunitätsfeld (361 Stück), verknüpft mit Ideen
+- **WissenNote** — ein persönlicher Wissensbereich (37 Stück), verknüpft mit Ideen
+
+Jede Idee wird über drei Dimensionen bewertet:
+1. **Chance-Score** — Qualität der verknüpften Problembereiche (wie groß, dringend, verbreitet ist das Problem?)
+2. **Wissen-Score** — Überlappung mit vorhandenem Expertenwissen (Bioreaktoren, Mikrobiologie, etc.)
+3. **Intrinsic-Score** — manuell gesetzte persönliche Einschätzung (Impact, Schwierigkeit, Innovativität, Zeiteinsatz)
+
+Diese drei werden gewichtet kombiniert: `0.40 × chance + 0.25 × wissen + 0.35 × intrinsic`
+
+---
+
+## Aktueller Datenstand: 142 Ideen
+
+### Research-Tiefe pro Idee
+
+| Tier | Tool | Ideen | Was wurde gesammelt |
+|------|------|------:|---------------------|
+| T1 | Tavily (Web-Snippets) | 142 | 4 Markt-Scores (1–6) aus Snippet-Extraktion via Haiku |
+| T2 | Claude Sonnet + Web Search | 48 | 4 Markt-Scores + Fließtext-Narrative (3–6 Sätze mit $-Zahlen, CAGR, Konkurrenten) |
+| T3 | Perplexity sonar-pro | 0 | *wartet auf API-Key* |
+| T4 | Firecrawl (vollständige Seiten) | 3 | 4 Markt-Scores + tiefes Narrative (Statista/Fortune Business Insights etc.) |
+| T5 | Autonomer 3-Loop (Claude) | 0 | Gegenargumente, Wettbewerber mit Zahlen, Markteintrittsbarrieren |
+
+**Die 4 Markt-Scores (alle 1=best, 6=worst):**
+- `market_size` — globale Marktgröße (1 = >$10B, 6 = <$10M)
+- `market_potential` — Wachstumsrate/CAGR (1 = >20%/Jahr, 6 = stagnierend)
+- `prevalence` — Verbreitung des Problems (1 = Millionen betroffen, 6 = Randfall)
+- `market_awareness` — Bekanntheit des Problems (1 = etabliertes Problem, 6 = unbekannt)
+
+**Wo die Texte zu finden sind:**
+- T2-Narrative für 45 Ideen: `reports/t2_review_2026-04-19.md`
+- T4-Narrative für 3 Ideen (microbial_omega3, High_performance_mulch, balkongarten): ebenfalls in `reports/t2_review_2026-04-19.md`
+
+---
+
+## Top 15 Leaderboard (aktueller Stand)
+
+| # | Idee | Score | Tier | mSz | mPot | prev | mAw | intr |
+|---|------|------:|:----:|:---:|:----:|:----:|:---:|:----:|
+| 1 | microbial_omega3 | 5.385 | T2 | 2 | 2 | 1 | 1 | 5.6 |
+| 2 | High_performance_mulch | 5.273 | T2 | 3 | 2 | 1 | 2 | 5.4 |
+| 3 | balkongarten | 4.927 | T2 | 2 | 2 | 1 | 2 | 5.6 |
+| 4 | doorframe_fittness | 4.702 | T2 | 3 | 2 | 1 | 2 | 5.4 |
+| 5 | crop_and_soil_specific_mycorrhizal_fertilizer | 3.831 | T1 | 2 | 1 | 2 | 2 | 2.8 |
+| 6 | durre_resilienz_vorhersage | 3.739 | T2 | 3 | 1 | 2 | 4 | 2.6 |
+| 7 | phosphor_effizienz_predictor | 3.737 | T2 | 3 | 2 | 2 | 3 | 2.4 |
+| 8 | boden_restaurations_erfolgs_predictor | 3.722 | T2 | 3 | 2 | 2 | 3 | 2.4 |
+| 9 | anti_pilz_peptid_generator | 3.647 | T2 | 1 | 3 | 1 | 2 | 2.6 |
+| 10 | natural_house_climat_systems | 3.553 | T2 | 2 | 2 | 1 | 3 | 2.6 |
+| 11 | microbial_battelfield_remediation | 3.533 | T2 | 2 | 1 | 2 | 3 | 2.8 |
+| 12 | crop_flavor_predictor | 3.533 | T2 | 3 | 1 | 3 | 5 | 2.6 |
+| 13 | holistic_fitnessstudio | 3.518 | T2 | 2 | 2 | 1 | 3 | 2.6 |
+| 14 | influencer | 3.499 | T2 | 1 | 1 | 1 | 2 | 3.0 |
+| 15 | abwasser_mikrobiom_alarm | 3.497 | T2 | 2 | 1 | 2 | 3 | 2.8 |
+
+*Vollständiges Leaderboard (alle 142): `LEADERBOARD.md`*
+
+---
+
+## Bekannte Schwachstellen / Verzerrungen
+
+### 1. Intrinsic-Score dominiert Top 4
+Die Ideen auf Plätzen 1–4 haben `intr ≈ 5.4–5.6` (sehr hoch). Das liegt daran, dass diese Ideen **manuell gesetzte** intrinsic-Werte haben (Impact=1, Difficulty=1 etc. — also die besten möglichen Werte). Alle anderen 138 Ideen haben Default-Werte (6 = worst), weil der LLM-Schritt zur automatischen Intrinsic-Bewertung (Step 11) noch nicht implementiert ist.
+
+**Folge:** Die Top 4 sind strukturell bevorzugt. Das Ranking ab Platz 5 ist fairer, weil es nur auf Chance/Wissen/Markt-Scores basiert.
+
+### 2. T1-Scores sind grob
+Tavily liefert nur Snippet-Fragmente. Haiku extrahiert daraus Scores ohne vollen Kontext. Bei 94 Ideen (noch auf T1) sind die Markt-Scores deshalb weniger verlässlich.
+
+### 3. Wissen-Links noch unvollständig
+129 von 142 Ideen haben Wissen-Links. 13 haben keine. Der Linking-Algorithmus hat konservativ nur sichere Matches gesetzt.
+
+### 4. Chance-Scores kommen aus Vault-Daten
+Die 361 Chancen wurden manuell oder per LLM mit Scores versehen. Die Qualität dieser Scores ist heterogen — frühe Chancen haben sorgfältigere Bewertungen als später eingepflegte.
+
+---
+
+## Dominante Wissensgebiete (Top 10)
+
+| Wissensbereich | Ideen die es nutzen |
+|----------------|:-------------------:|
+| mikrobiologie | 71 |
+| biochemie | 54 |
+| oekologie | 47 |
+| mycologie | 41 |
+| fermentation | 38 |
+| bioreactors | 28 |
+| biologie | 28 |
+| botanik | 24 |
+| gene_engineering | 16 |
+| mechatronik | 14 |
+
+→ Das Portfolio ist stark auf Bio/Agri/Fermentation konzentriert. Nur wenige Ideen liegen außerhalb dieses Clusters (balkongarten, doorframe_fittness, holistic_fitnessstudio).
+
+---
+
+## Was als nächstes geplant ist
+
+| Schritt | Was | Voraussetzung |
+|---------|-----|---------------|
+| T3 | Perplexity-Research für Top 10 | API-Key eintragen in `.env` |
+| T4 | Firecrawl für Top 5 | Neue Firecrawl-Credits kaufen (€17/3000) |
+| T5 | Autonomer Research-Loop für Top 5 | T4 abgeschlossen |
+| Step 10 | Intrinsic-Scores per LLM für alle 142 Ideen | — |
+| Step 11 | Re-Scoring nach Intrinsic-Update | Step 10 |
+
+---
+
+## Offene Fragen zur Diskussion
+
+1. **Macht das Scoring-System Sinn?** Die Gewichtung `0.40/0.25/0.35` ist ein erster Entwurf. Sollte Markt-Research stärker gewichtet werden als persönliches Wissen?
+
+2. **Sind die Top 4 wirklich die besten Ideen?** Oder sind sie nur bevorzugt weil sie manuell gut bewertet wurden (Intrinsic-Score)? → Kritisch diskutieren bevor T3/T4 drauf verwendet wird.
+
+3. **Was fehlt inhaltlich?** Die Pipeline bewertet Marktgröße und persönliches Wissen, aber nicht: Wettbewerbsdichte, Regulierungs-Risiko, Time-to-Market, Capital-Intensität.
+
+4. **Nächster konkreter Schritt:** Perplexity-Key holen und T3 für Top 10 laufen lassen — oder erst Step 10 (Intrinsic-Scores) implementieren damit das Ranking stabiler ist?
+
+
+---
+LEADERBOARD.md
+---
+# Idea Leaderboard — 2026-04-19
+
+**142 ideas scored** · generated by `ideapipe report`
+
+| # | Idea | Score | Tier | mSz | mPot | prev | mAw | ch↑ | ws↑ | intr↑ | Wissen |
+|---|------|------:|:----:|:---:|:----:|:----:|:---:|:---:|:---:|:-----:|--------|
+| 1 | microbial_omega3 | 5.385 | T2 | 2 | 2 | 1 | 1 | 6.0 | 4.1 | 5.6 | bioreactors, ernaehrung, mikrobiologie |
+| 2 | High_performance_mulch | 5.273 | T2 | 3 | 2 | 1 | 2 | 6.0 | 3.9 | 5.4 | gaertnern, mikrobiologie, oekologie |
+| 3 | balkongarten | 4.927 | T2 | 2 | 2 | 1 | 2 | 5.2 | 3.6 | 5.6 | ernaehrung, gaertnern, mechatronik |
+| 4 | doorframe_fittness | 4.702 | T2 | 3 | 2 | 1 | 2 | 4.8 | 3.6 | 5.4 | mechatronik, resistance_training |
+| 5 | crop_and_soil_specific_mycorrhizal_fertilizer | 3.831 | T1 | 2 | 1 | 2 | 2 | 4.3 | 4.5 | 2.8 | mycologie, mikrobiologie, oekologie, biochemie, biologie |
+| 6 | durre_resilienz_vorhersage | 3.739 | T2 | 3 | 1 | 2 | 4 | 4.3 | 4.4 | 2.6 | mycologie, oekologie, botanik |
+| 7 | phosphor_effizienz_predictor | 3.737 | T2 | 3 | 2 | 2 | 3 | 4.7 | 4.1 | 2.4 | botanik, mikrobiologie, oekologie, gaertnern |
+| 8 | boden_restaurations_erfolgs_predictor | 3.722 | T2 | 3 | 2 | 2 | 3 | 4.6 | 4.2 | 2.4 | mycologie, botanik, oekologie, gaertnern |
+| 9 | anti_pilz_peptid_generator | 3.647 | T2 | 1 | 3 | 1 | 2 | 4.3 | 4.0 | 2.6 | gene_engineering, biochemie, enzymologie, mikrobiologie |
+| 10 | natural_house_climat_systems | 3.553 | T2 | 2 | 2 | 1 | 3 | 4.1 | 4.0 | 2.6 | architektur, bauwesen, botanik, oekologie, mechatronik |
+| 11 | microbial_battelfield_remediation | 3.533 | T2 | 2 | 1 | 2 | 3 | 3.8 | 4.2 | 2.8 | mikrobiologie, mycologie, oekologie |
+| 12 | crop_flavor_predictor | 3.533 | T2 | 3 | 1 | 3 | 5 | 3.8 | 4.4 | 2.6 | biochemie, botanik, ernaehrung |
+| 13 | holistic_fitnessstudio | 3.518 | T2 | 2 | 2 | 1 | 3 | 4.1 | 3.9 | 2.6 | bewegungskultur, ernaehrung, fermentation, gesundheit, mentale_gesundheit |
+| 14 | influencer | 3.499 | T2 | 1 | 1 | 1 | 2 | 3.9 | 3.6 | 3.0 | psychologie, mentale_gesundheit, philosophie, selbstverbesserung |
+| 15 | abwasser_mikrobiom_alarm | 3.497 | T2 | 2 | 1 | 2 | 3 | 3.5 | 4.5 | 2.8 | mikrobiologie, biologie, oekologie |
+| 16 | dach_zu_grundwasser | 3.460 | T2 | 2 | 1 | 1 | 2 | 3.9 | 3.8 | 2.8 | bauwesen, mechatronik, oekologie |
+| 17 | lichin_protect_facade_paint | 3.458 | T2 | 3 | 2 | 2 | 4 | 3.9 | 4.3 | 2.4 | oekologie, bauwesen, botanik |
+| 18 | water_systemdesigne | 3.417 | T2 | 2 | 1 | 1 | 2 | 3.5 | 4.2 | 2.8 | oekologie, bauwesen, botanik, gaertnern |
+| 19 | kaugummi | 3.417 | T2 | 2 | 2 | 1 | 3 | 3.4 | 4.6 | 2.6 | ernaehrung, gesundheit, biochemie, kritisches_denken |
+| 20 | ai_live_videobased_trainingscoach | 3.395 | T2 | 1 | 1 | 1 | 2 | 3.5 | 3.8 | 3.0 | bewegungskultur, anatomie, resistance_training, selbstverbesserung, vibe_coding |
+| 21 | bioreactor_spidersilk | 3.389 | T2 | 3 | 1 | 2 | 2 | 3.7 | 4.0 | 2.6 | bioreactors, heterologe_expression, gene_engineering, pichia_pastoris |
+| 22 | personalisierter_ferment_matchmaker | 3.368 | T2 | 1 | 2 | 1 | 2 | 3.4 | 4.0 | 2.8 | fermentation, mikrobiologie, ernaehrung, gesundheit |
+| 23 | daylight_system_designes | 3.358 | T2 | 2 | 1 | 1 | 3 | 3.4 | 4.0 | 2.8 | architektur, wohnungsdesign, bauwesen, gesundheit |
+| 24 | krauterseitling_x_kaffeesatzt | 3.349 | T2 | 1 | 3 | 2 | 3 | 3.7 | 3.8 | 2.6 | pilzkultivierung, mycologie, gaertnern |
+| 25 | bodengesundheits_score_aus_metagenomik | 3.321 | T2 | 3 | 1 | 2 | 3 | 3.2 | 4.5 | 2.6 | mikrobiologie, oekologie, biochemie, biologie |
+| 26 | continuous_bioreaktor_assey_loop | 3.317 | T2 | 2 | 1 | 2 | 2 | 1.0 | 3.5 | 5.8 | bioreactors, mechatronik |
+| 27 | dunger_optimierer | 3.312 | T2 | 2 | 1 | 1 | 2 | 3.1 | 4.3 | 2.8 | mikrobiologie, oekologie, botanik, biochemie |
+| 28 | waldbrand_erholungs_predictor | 3.308 | T2 | 5 | 2 | 3 | 5 | 3.9 | 4.3 | 2.0 | mycologie, oekologie, mikrobiologie, botanik |
+| 29 | microbial_protein_feed_for_livestock | 3.303 | T2 | 1 | 1 | 1 | 2 | 3.2 | 3.9 | 3.0 | fermentation, mikrobiologie, ernaehrung |
+| 30 | pilzkrankheits_fruhwarnung_fur_kulturpflanzen | 3.290 | T2 | 1 | 2 | 1 | 2 | 3.1 | 4.2 | 2.8 | mycologie, botanik, oekologie, gaertnern |
+| 31 | rewilding_planer | 3.280 | T2 | 2 | 2 | 2 | 5 | 3.1 | 4.5 | 2.6 | mycologie, mikrobiologie, oekologie, biologie |
+| 32 | bioaktive_peptid_entdecker | 3.268 | T2 | 2 | 1 | 1 | 3 | 3.1 | 4.2 | 2.8 | fermentation, biochemie, biologie, enzymologie |
+| 33 | insect_based_protein_and_or_lipid_supplementes | 3.245 | T2 | 3 | 1 | 2 | 3 | 3.2 | 4.3 | 2.6 | biochemie, ernaehrung, kraftsport, oekologie |
+| 34 | crop_yield_booster | 3.233 | T2 | 3 | 1 | 2 | 3 | 3.1 | 4.3 | 2.6 | mycologie, mikrobiologie, oekologie, botanik |
+| 35 | personal_microbiome_terroir | 3.209 | T2 | 2 | 1 | 1 | 3 | 3.2 | 3.9 | 2.8 | fermentation, mikrobiologie, ernaehrung |
+| 36 | carbon_sequestration_calculator | 3.203 | T2 | 3 | 2 | 2 | 4 | 3.1 | 4.4 | 2.4 | mycologie, oekologie, biochemie, botanik |
+| 37 | waldgesundheits_monitor_via_mykorrhiza | 3.193 | T2 | 3 | 2 | 2 | 3 | 3.1 | 4.4 | 2.4 | mycologie, oekologie, botanik |
+| 38 | parasitaere_pestizide | 3.192 | T1 | 2 | 4 | 1 | 2 | 3.5 | 4.1 | 2.2 | oekologie, botanik, mikrobiologie, gaertnern |
+| 39 | phd_um_facilies_fur_eigene_zwecke_zu_nutzen | 3.171 | T2 | 2 | 1 | 1 | 3 | 3.1 | 3.9 | 2.8 | mycologie, pilzkultivierung |
+| 40 | truffel_standort_predictor | 3.166 | T2 | 4 | 3 | 5 | 4 | 3.5 | 4.3 | 2.0 | mycologie, oekologie, botanik, mikrobiologie |
+| 41 | airhyphea_buldingmaterial_additive | 3.162 | T2 | 2 | 2 | 2 | 3 | 3.1 | 4.0 | 2.6 | mycologie, pilzkultivierung, bioreactors, fermentation, biochemie |
+| 42 | arthropod_gut_microbe_symbiotic_plastic_degradation | 3.150 | T2 | 5 | 2 | 1 | 3 | 3.5 | 4.2 | 2.0 | gene_engineering, enzymologie, mikrobiologie, oekologie, biologie |
+| 43 | mykorrhiza_klima_resilienz_modell | 3.143 | T2 | 3 | 2 | 1 | 4 | 2.9 | 4.6 | 2.4 | botanik, mycologie, oekologie, biologie |
+| 44 | urban_sponge_systems | 3.081 | T2 | 1 | 1 | 1 | 2 | 2.4 | 4.2 | 3.0 | oekologie, bauwesen, botanik, architektur |
+| 45 | business_idea_generator | 3.061 | T2 | 2 | 1 | 1 | 2 | 2.9 | 3.7 | 2.8 | kritisches_denken, philosophie, vibe_coding, management |
+| 46 | carbon_credit_verifizierer | 3.031 | T2 | 3 | 1 | 2 | 3 | 2.7 | 4.2 | 2.6 | mikrobiologie, oekologie, biochemie |
+| 47 | personal_coacing | 3.014 | T2 | 1 | 2 | 1 | 2 | 2.8 | 3.6 | 2.8 | mentale_gesundheit, psychologie, philosophie, selbstverbesserung |
+| 48 | invasive_pflanzen_risiko_modell | 2.970 | T2 | 5 | 4 | 4 | 6 | 3.1 | 4.6 | 1.6 | mycologie, botanik, oekologie, biologie |
+| 49 | home_biogas | 2.969 | T2 | 3 | 2 | 2 | 3 | 3.1 | 3.6 | 2.4 | fermentation, mikrobiologie, bauwesen, mechatronik |
+| 50 | mikrobiom_basierter_lugendetektor_fur_lebensmittelzertifizierungen | 2.930 | T1 | 2 | 1 | 4 | 3 | 2.0 | 4.6 | 2.8 | mikrobiologie, biologie |
+| 51 | clipon_screen_daylight_lamp | 2.918 | T1 | 2 | 2 | 2 | 2 | 2.7 | 3.8 | 2.6 | mechatronik, heimwerken, wohnungsdesign |
+| 52 | high_performance_mulch | 2.889 | T1 | 2 | 2 | 2 | 2 | 2.4 | 4.0 | 2.6 | mycologie, pilzkultivierung, botanik, gaertnern, oekologie |
+| 53 | synthetisches_bodenmikrobiom_designer | 2.885 | T1 | 2 | 2 | 2 | 5 | 2.2 | 4.3 | 2.6 | mikrobiologie, oekologie, botanik, biochemie |
+| 54 | fungal_wastwater_posttreatment | 2.876 | T1 | 2 | 2 | 1 | 2 | 2.2 | 4.3 | 2.6 | mycologie, mikrobiologie, oekologie, biochemie |
+| 55 | crop_disease_outbreak_alarm | 2.853 | T1 | 4 | 1 | 4 | 5 | 2.2 | 4.5 | 2.4 | mikrobiologie, mycologie, oekologie, biologie |
+| 56 | mykorrhiza_inokulant_designer | 2.808 | T1 | 4 | 4 | 4 | 5 | 2.9 | 4.1 | 1.8 | mycologie, botanik, oekologie, pilzkultivierung |
+| 57 | bio_leder_wachstumsmodell | 2.795 | T2 | 5 | 2 | 3 | 4 | 2.7 | 4.1 | 2.0 | mycologie, pilzkultivierung, bioreactors, biochemie |
+| 58 | stickstoff_fixierungs_effizienz_scorer | 2.792 | T1 | 5 | 1 | 3 | 5 | 2.2 | 4.5 | 2.2 | mikrobiologie, biochemie, oekologie, biologie |
+| 59 | optimal_mykorrhiza_matchmaker | 2.769 | T1 | 4 | 2 | 5 | 5 | 2.4 | 4.2 | 2.2 | botanik, mycologie, gaertnern, oekologie |
+| 60 | naturfarbstoff_optimierer | 2.753 | T1 | 2 | 2 | 5 | 3 | 2.2 | 3.9 | 2.6 | fermentation, pilzkultivierung, biochemie, mycologie |
+| 61 | ai_sommelier | 2.739 | T1 | 3 | 4 | 2 | 5 | 2.7 | 3.9 | 2.0 | fermentation, biochemie, enzymologie, mikrobiologie |
+| 62 | museum_konservierungs_ki | 2.662 | T1 | 4 | 4 | 3 | 5 | 2.1 | 4.8 | 1.8 | biologie, oekologie |
+| 63 | kompost_reife_ampel | 2.629 | T1 | 5 | 2 | 4 | 6 | 2.4 | 3.9 | 2.0 | oekologie, mikrobiologie, gaertnern |
+| 64 | schwefelporling_fleischersatzt | 2.626 | T1 | 4 | 2 | 4 | 5 | 2.2 | 3.9 | 2.2 | pilzkultivierung, mycologie, kochen, ernaehrung |
+| 65 | pilzarten_erkennung_aus_edna | 2.623 | T1 | 4 | 1 | 3 | 5 | 1.6 | 4.5 | 2.4 | mycologie, mikrobiologie, biologie |
+| 66 | bodenmikrobiom_forensik | 2.572 | T1 | 4 | 2 | 4 | 5 | 1.7 | 4.5 | 2.2 | mikrobiologie, oekologie, biologie |
+| 67 | schwermetall_bioremediations_predictor | 2.558 | T1 | 4 | 2 | 2 | 6 | 1.8 | 4.2 | 2.2 | mikrobiologie, biochemie, oekologie |
+| 68 | sourdough_autopilot | 2.556 | T1 | 5 | 4 | 2 | 5 | 2.7 | 3.7 | 1.6 | fermentation, mikrobiologie, kochen |
+| 69 | metabolom_nowcasting | 2.541 | T1 | 3 | 1 | 2 | 6 | 1.0 | 4.9 | 2.6 | biochemie, biologie |
+| 70 | pilz_allergen_predictor | 2.534 | T1 | 4 | 4 | 4 | 5 | 1.8 | 4.8 | 1.8 | mycologie, biochemie, biologie |
+| 71 | pilz_pathogenitats_classifier | 2.533 | T1 | 1 | 2 | 2 | 6 | 1.0 | 4.6 | 2.8 | mycologie, mikrobiologie, biologie, kritisches_denken |
+| 72 | pestizid_abbau_predictor | 2.491 | T1 | 4 | 3 | 2 | 2 | 1.8 | 4.3 | 2.0 | mikrobiologie, biochemie, oekologie, botanik |
+| 73 | boden_verflussigungs_risiko | 2.473 | T1 | 5 | 5 | 6 | 6 | 2.7 | 3.7 | 1.4 | mikrobiologie, oekologie, mechatronik |
+| 74 | melanin_based_radiation_energy_harvesting | 2.435 | T1 | 2 | 2 | 6 | 5 | 1.0 | 4.5 | 2.6 | biochemie, biologie, enzymologie |
+| 75 | sidestream_diesel_lipidproduction | 2.434 | T1 | 2 | 1 | 2 | 2 | 1.0 | 4.2 | 2.8 | bioreactors, mikrobiologie, biochemie |
+| 76 | antibiotikaresistenz_tracker_in_fermenten | 2.433 | T1 | 1 | 2 | 4 | 5 | 1.0 | 4.2 | 2.8 | fermentation, mikrobiologie, biologie, bioreactors |
+| 77 | pilz_taxonomie_automat | 2.428 | T1 | 4 | 1 | 4 | 5 | 1.0 | 4.8 | 2.4 | mycologie, biologie, botanik |
+| 78 | mykotoxin_risiko_predictor | 2.426 | T1 | 5 | 4 | 1 | 5 | 2.0 | 4.3 | 1.6 | mycologie, biochemie, mikrobiologie, bioreactors |
+| 79 | manneekreis_fur_junge_manner | 2.424 | T1 | 2 | 2 | 2 | 3 | 3.8 | 0.0 | 2.6 | — |
+| 80 | space_farming_simulator | 2.407 | T1 | 5 | 5 | 6 | 6 | 2.0 | 4.5 | 1.4 | mikrobiologie, biologie, oekologie |
+| 81 | raman_spektren_interpreter | 2.405 | T1 | 2 | 1 | 2 | 3 | 1.0 | 4.1 | 2.8 | biochemie, enzymologie |
+| 82 | metabolischer_pfad_halluzinator | 2.395 | T1 | 4 | 2 | 5 | 2 | 1.0 | 4.9 | 2.2 | biochemie, biologie, kritisches_denken |
+| 83 | cazyme_aktivitats_predictor | 2.393 | T1 | 2 | 1 | 2 | 2 | 1.0 | 4.0 | 2.8 | enzymologie, biochemie, gene_engineering |
+| 84 | enzym_generator | 2.383 | T1 | 2 | 1 | 2 | 2 | 1.0 | 4.0 | 2.8 | enzymologie, biochemie, gene_engineering, heterologe_expression |
+| 85 | novel_antimykotika_target_finder | 2.377 | T1 | 3 | 2 | 4 | 5 | 1.0 | 4.5 | 2.4 | mycologie, gene_engineering, biochemie, biologie |
+| 86 | precision_fermentation_yield_predictor | 2.375 | T1 | 2 | 1 | 2 | 2 | 1.0 | 4.0 | 2.8 | fermentation, bioreactors, heterologe_expression, pichia_pastoris, biochemie |
+| 87 | starter_culture_designer | 2.371 | T1 | 2 | 1 | 2 | 3 | 1.0 | 4.0 | 2.8 | fermentation, mikrobiologie, biochemie, gene_engineering |
+| 88 | biopharma_batch_release_predictor | 2.364 | T1 | 1 | 3 | 6 | 4 | 1.0 | 4.2 | 2.6 | bioreactors, biochemie, heterologe_expression |
+| 89 | kombucha_scoby_gesundheitsindex | 2.359 | T1 | 2 | 1 | 3 | 6 | 1.0 | 3.9 | 2.8 | fermentation, mikrobiologie, mycologie |
+| 90 | biogas_yield_optimizer | 2.342 | T1 | 1 | 2 | 2 | 3 | 1.0 | 3.9 | 2.8 | mikrobiologie, fermentation, oekologie |
+| 91 | kasereife_orakel | 2.329 | T1 | 2 | 2 | 2 | 5 | 1.0 | 4.1 | 2.6 | fermentation, mikrobiologie, mycologie, biochemie |
+| 92 | penicillin_yield_maximizer | 2.327 | T1 | 2 | 2 | 5 | 5 | 1.0 | 4.1 | 2.6 | bioreactors, fermentation, biochemie |
+| 93 | digital_twin_framework | 2.327 | T1 | 2 | 2 | 3 | 3 | 1.0 | 4.1 | 2.6 | fermentation, bioreactors, biochemie |
+| 94 | kontaminationsquelle_forensik | 2.322 | T1 | 2 | 2 | 2 | 2 | 1.0 | 4.0 | 2.6 | mikrobiologie, bioreactors |
+| 95 | novel_ferment_generator | 2.321 | T1 | 2 | 1 | 2 | 2 | 1.0 | 3.8 | 2.8 | fermentation, mikrobiologie, biochemie, vibe_coding |
+| 96 | pilznetzwerk_als_neurales_netz | 2.315 | T1 | 2 | 3 | 5 | 5 | 1.0 | 4.3 | 2.4 | mycologie, oekologie |
+| 97 | uhts_directed_plastic_degradation_evolution | 2.313 | T1 | 2 | 2 | 2 | 5 | 1.0 | 4.0 | 2.6 | mikrobiologie, gene_engineering, enzymologie, biochemie |
+| 98 | ki_braumeister | 2.302 | T1 | 2 | 2 | 4 | 6 | 1.0 | 4.0 | 2.6 | fermentation, mikrobiologie, biochemie |
+| 99 | hefe_phanotyp_predictor | 2.299 | T1 | 2 | 3 | 5 | 6 | 1.0 | 4.2 | 2.4 | biologie, mikrobiologie, gene_engineering, pichia_pastoris |
+| 100 | multi_produkt_fermentations_planer | 2.280 | T1 | 2 | 1 | 4 | 3 | 1.0 | 3.6 | 2.8 | fermentation, bioreactors, management |
+| 101 | sekundarmetabolit_yield_predictor | 2.277 | T1 | 3 | 2 | 2 | 3 | 1.0 | 4.2 | 2.4 | gene_engineering, bioreactors, biochemie, mikrobiologie |
+| 102 | hitze_und_kalte_resistente_mikroorganismen_mit_besonders_hoher_proteinproduktion | 2.274 | T1 | 3 | 2 | 2 | 5 | 1.0 | 4.1 | 2.4 | mikrobiologie, bioreactors, heterologe_expression, biochemie |
+| 103 | energieoptimaler_fermentations_scheduler | 2.257 | T1 | 2 | 3 | 2 | 4 | 1.0 | 4.1 | 2.4 | bioreactors, fermentation, biochemie |
+| 104 | microbial_citin_packaging | 2.240 | T1 | 3 | 2 | 4 | 5 | 1.0 | 4.0 | 2.4 | bioreactors, fermentation, gene_engineering, mycologie |
+| 105 | food_fraud_detektor | 2.226 | T1 | 4 | 2 | 2 | 5 | 1.0 | 4.2 | 2.2 | mikrobiologie, biochemie |
+| 106 | bioreaktor_sensor_fusion | 2.218 | T1 | 2 | 2 | 4 | 6 | 1.0 | 3.6 | 2.6 | bioreactors, mechatronik, pichia_pastoris |
+| 107 | ocean_to_land_transfer_learning | 2.217 | T1 | 3 | 4 | 2 | 5 | 1.0 | 4.5 | 2.0 | biologie, oekologie, mikrobiologie |
+| 108 | echtzeit_anomalie_detektion_in_industriefermentationen | 2.209 | T1 | 4 | 1 | 4 | 4 | 1.0 | 3.9 | 2.4 | bioreactors, fermentation, mikrobiologie, gene_engineering |
+| 109 | ultimaten_winter_cloths | 2.207 | T1 | 3 | 2 | 2 | 4 | 3.4 | 0.0 | 2.4 | — |
+| 110 | medical_mushroom_bioreactor_cultivation | 2.198 | T1 | 2 | 4 | 4 | 2 | 1.0 | 4.1 | 2.2 | pilzkultivierung, mycologie, bioreactors, biochemie |
+| 111 | extra_highe_cellulase_bioreactor_strains_for_textile_biogas | 2.197 | T1 | 3 | 2 | 1 | 5 | 1.0 | 3.8 | 2.4 | bioreactors, fermentation, mikrobiologie, gene_engineering, enzymologie |
+| 112 | fed_batch_feed_strategie_via_diffusion_models | 2.187 | T1 | 4 | 2 | 2 | 4 | 1.0 | 4.1 | 2.2 | bioreactors, fermentation, biochemie |
+| 113 | fungal_drug_discovery_pipeline | 2.179 | T1 | 4 | 2 | 4 | 4 | 1.0 | 4.0 | 2.2 | mycologie, pilzkultivierung, biochemie, mikrobiologie |
+| 114 | fermentations_metabolom_forecaster | 2.176 | T1 | 4 | 2 | 2 | 5 | 1.0 | 4.0 | 2.2 | bioreactors, fermentation, biochemie, mikrobiologie |
+| 115 | upo_waste_detoxification | 2.173 | T1 | 4 | 2 | 2 | 6 | 1.0 | 4.0 | 2.2 | mikrobiologie, gene_engineering, biochemie, enzymologie |
+| 116 | barfus_adiletten | 2.170 | T1 | 2 | 4 | 2 | 2 | 3.5 | 0.0 | 2.2 | — |
+| 117 | shelf_life_prediction_fur_fermentierte_produkte | 2.169 | T1 | 3 | 2 | 5 | 3 | 1.0 | 3.7 | 2.4 | fermentation, mikrobiologie, kochen |
+| 118 | scale_up_transformer | 2.164 | T1 | 3 | 1 | 2 | 2 | 1.0 | 3.4 | 2.6 | bioreactors, mechatronik, management |
+| 119 | dating_app_fur_mikroben | 2.162 | T1 | 2 | 4 | 3 | 4 | 1.0 | 4.0 | 2.2 | mikrobiologie, biochemie, fermentation |
+| 120 | pandemie_fruhwarnung_aus_umwelt_metagenomik | 2.147 | T1 | 4 | 4 | 2 | 2 | 1.0 | 4.5 | 1.8 | mikrobiologie, biologie, oekologie |
+| 121 | schimmelrisiko_predictor_fur_gebaude | 2.138 | T1 | 3 | 4 | 1 | 3 | 1.0 | 4.2 | 2.0 | mycologie, bauwesen, mikrobiologie |
+| 122 | myzelium_material_optimizer | 2.117 | T1 | 3 | 3 | 2 | 3 | 1.0 | 3.8 | 2.2 | mycologie, pilzkultivierung, biochemie, mechatronik |
+| 123 | kimchi_crash_detektor | 2.117 | T1 | 5 | 2 | 6 | 5 | 1.0 | 4.1 | 2.0 | fermentation, mikrobiologie, kritisches_denken |
+| 124 | chocolate_fermentation_optimizer | 2.099 | T1 | 4 | 2 | 6 | 6 | 1.0 | 3.7 | 2.2 | fermentation, mikrobiologie, kochen |
+| 125 | fungal_genome_completeness_scorer | 2.098 | T1 | 5 | 4 | 6 | 6 | 1.0 | 4.5 | 1.6 | mycologie, biologie, gene_engineering |
+| 126 | sauerteig_aroma_gan | 2.092 | T1 | 3 | 4 | 5 | 6 | 1.0 | 4.0 | 2.0 | fermentation, mikrobiologie, biochemie |
+| 127 | fermentations_zeitmaschine | 2.084 | T1 | 5 | 3 | 3 | 5 | 1.0 | 4.2 | 1.8 | mikrobiologie, biologie, fermentation |
+| 128 | off_flavor_predictor_fur_craft_beer | 2.081 | T1 | 5 | 2 | 4 | 6 | 1.0 | 3.9 | 2.0 | fermentation, biochemie, mikrobiologie, kochen |
+| 129 | biosynthetic_gene_cluster_zu_molekul_modell | 2.063 | T1 | 4 | 4 | 4 | 5 | 1.0 | 4.1 | 1.8 | gene_engineering, biochemie, mikrobiologie |
+| 130 | continuous_fermentation_stability_predictor | 2.047 | T1 | 4 | 4 | 6 | 6 | 1.0 | 4.1 | 1.8 | bioreactors, fermentation, biochemie |
+| 131 | city_scanner | 2.030 | T1 | 4 | 4 | 4 | 2 | 3.5 | 0.0 | 1.8 | — |
+| 132 | terroir_klassifikator | 1.992 | T1 | 4 | 4 | 4 | 3 | 1.0 | 3.9 | 1.8 | mikrobiologie, fermentation, oekologie |
+| 133 | wood_bioreactor_substrate_for_liquidculture | 1.992 | T1 | 4 | 4 | 2 | 6 | 1.0 | 3.9 | 1.8 | bioreactors, fermentation, pilzkultivierung, mycologie, mikrobiologie |
+| 134 | biopigment_based_electricity_carotinoide | 1.976 | T1 | 5 | 3 | 3 | 5 | 1.0 | 3.8 | 1.8 | mikrobiologie, biochemie, mechatronik |
+| 135 | ultra_high_cell_density_submersable_periodic_continuous_od_sensore | 1.947 | T1 | 4 | 4 | 4 | 6 | 1.0 | 3.7 | 1.8 | bioreactors, mechatronik, heterologe_expression |
+| 136 | biodeterioration_predictor | 1.932 | T1 | 6 | 4 | 2 | 6 | 1.0 | 4.2 | 1.4 | mycologie, oekologie, mikrobiologie |
+| 137 | werkzeug_finder | 1.926 | T1 | 2 | 4 | 4 | 2 | 1.0 | 3.0 | 2.2 | mechatronik, vibe_coding |
+| 138 | pilz_batterien | 1.859 | T1 | 4 | 4 | 4 | 6 | 3.1 | 0.0 | 1.8 | — |
+| 139 | reis_wein_metagenom_classifier | 1.819 | T1 | 6 | 4 | 5 | 5 | 1.0 | 3.7 | 1.4 | fermentation, mikrobiologie, kochen |
+| 140 | wast_water_detox_directed_evolution_platform | 1.450 | T1 | 1 | 1 | 2 | 3 | 1.0 | 0.0 | 3.0 | — |
+| 141 | raupen_styropor_recycling | 1.450 | T1 | 1 | 1 | 1 | 3 | 1.0 | 0.0 | 3.0 | — |
+| 142 | bauteilfinder | 1.240 | T1 | 3 | 2 | 2 | 2 | 1.0 | 0.0 | 2.4 | — |
+
+---
+
+**Column guide**
+- **Score**: composite pipeline score (higher = better, max 6.0)
+- **Tier**: highest research tier completed (T1=Tavily … T5=AutoResearch)
+- **mSz** market_size · **mPot** market_potential · **prev** prevalence · **mAw** market_awareness — all 1–6 (1=best)
+- **ch↑** chance score · **ws↑** wissen score · **intr↑** intrinsic score — components of composite (higher=better)
+
+
+---
