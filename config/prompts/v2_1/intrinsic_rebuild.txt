@@ -16,8 +16,9 @@ attractiveness.mission_fit: Wie gut passt die Idee zu einer Mission "Menschen he
 fit.difficulty: Wie schwierig ist die technische/operative Umsetzung für einen Solo-Gründer? (1=einfach mit bekannten Tools, 6=erfordert großes Team oder exotische Expertise)
 fit.time_to_first_revenue_months: Wie viele Monate bis zum ersten zahlenden Kunden? (Zahl, kein Score — schätze realistisch für Solo-Gründer, nicht für finanziertes Startup)
 
-capital_class: "bootstrappable" (< €50k bis zum ersten zahlenden Kunden), "seed" (€50k-€500k, EXIST/DBU-tauglich), oder "vc_dependent" (> €500k bevor Revenue möglich ist)
-regulation_class: "unregulated" (kein Zulassungsprozess — Software, Bildung, Content, B2B-Tools), "low" (CE-Kennzeichen, DSGVO, ISO — Standard-Compliance, 3-6 Monate), "high" (Novel Food, Arzneimittel, Biozid, Gentechnik, Medizinprodukt — > 1 Jahr + > €100k)
+capital_class: "bootstrappable" (< €50k bis zum ersten zahlenden Kunden), "seed" (€50k-€500k, förderbar durch EXIST/DBU/Innosuisse/EIC Accelerator), oder "vc_dependent" (> €500k bevor Revenue möglich ist)
+regulation_class: "unregulated" (kein Zulassungsprozess — Software, Bildung, Content, B2B-Tools), "low" (CE-Kennzeichen, DSGVO, ISO, Swissmedic-Registrierung Klasse I — Standard-Compliance, 3-6 Monate), "high" (Novel Food EU/CH, Arzneimittel, Biozid, Gentechnik, Medizinprodukt Klasse IIb/III — > 1 Jahr + > €100k; gilt auch für CH-Zulassung via Swissmedic wenn EU-Verfahren analog)
+Hinweis zu Regulierung: Bewerte nach dem strengsten anzuwendenden Regime im DACH/EU/CH-Raum. Wenn ein Produkt in Deutschland "high" wäre, aber in der Schweiz günstiger zuzulassen ist, vermerke das kurz im reasoning, stufe aber trotzdem nach dem worst-case ein.
 willingness_to_pay: Würden Kunden WIRKLICH dafür zahlen, nicht nur "finden es cool"? (1=hohe Zahlungsbereitschaft, klares Pain, 6=nice-to-have ohne Budget)
 
 reasoning: 1-2 Sätze Begründung für die kritischsten Werte
