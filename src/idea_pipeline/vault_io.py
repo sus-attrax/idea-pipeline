@@ -117,12 +117,15 @@ def _to_yaml_dict(note: BaseNote) -> dict:
         if key in data and isinstance(data[key], list):
             data[key] = [f"[[{v}]]" for v in data[key] if v]
 
-    # Pipeline-managed fields: remove from YAML entirely if not yet set.
-    # These only appear once the pipeline has actually computed them.
-    _PIPELINE_FIELDS = {
+    # Pipeline-managed and typed-optional fields: omit from YAML when None/empty.
+    # Typed fields (Literal, int, float) cannot round-trip through empty string.
+    _OMIT_WHEN_NONE = {
         "score", "score_breakdown", "score_version", "scored_at", "research_fidelity",
+        # v2.1 typed-optional fields — empty string cannot be parsed back
+        "capital_class", "regulation_class", "score_v1",
+        "fit_time_to_first_revenue_months",
     }
-    for key in _PIPELINE_FIELDS:
+    for key in _OMIT_WHEN_NONE:
         if key in data and (data[key] is None or data[key] == "" or data[key] == {}):
             del data[key]
 
