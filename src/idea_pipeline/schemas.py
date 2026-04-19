@@ -22,7 +22,7 @@ Design decisions:
 from __future__ import annotations
 
 import re
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -95,6 +95,18 @@ def _coerce_string_list(values: Any) -> list[str]:
     return [str(values)]
 
 
+class ScoreHistoryEntry(BaseModel):
+    """One entry in the per-idea score history log. Append-only."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    date: str                    # ISO date string, e.g. "2026-04-19"
+    version: str                 # "v1" or "v2.1"
+    score: float
+    rank: Optional[int] = None
+    trigger: Optional[str] = None
+
+
 class BaseNote(BaseModel):
     """Fields shared across Idee, Chance, Wissen notes."""
 
@@ -146,14 +158,10 @@ class BaseNote(BaseModel):
 class IdeeNote(BaseNote):
     """A business idea — the entity we ultimately rank."""
 
-    # Customer breakdown: explicit two-stage segmentation.
-    # NOTE: legacy `customer` field is no longer modeled. If old notes still
-    # have it, extra="allow" preserves it as raw passthrough (not used by
-    # the pipeline). Migration to first_adopters/mass_customers is a
-    # one-time LLM-enrichment task in Step 6+.
     first_adopters: list[str] = Field(default_factory=list)
     mass_customers: list[str] = Field(default_factory=list)
 
+    # v1 intrinsic fields — kept for backward compat, not read by v2.1 scoring
     market_size: ScoreValue = 6
     market_potential: ScoreValue = 6
     impact: ScoreValue = 6
@@ -161,11 +169,38 @@ class IdeeNote(BaseNote):
     time_investment: ScoreValue = 6
     innovativeness: ScoreValue = 6
 
-    # Links to chance and wissen notes (parsed from wikilinks)
+    # Links to chance and wissen notes
     chancen: list[str] = Field(default_factory=list)
     wissen: list[str] = Field(default_factory=list)
 
     notes: Optional[str] = None
+
+    # v2.1 Attractiveness (LLM-populated by enrich-intrinsic)
+    attractiveness_impact: ScoreValue = 6
+    attractiveness_innovativeness: ScoreValue = 6
+    attractiveness_mission_fit: ScoreValue = 6
+
+    # v2.1 Fit
+    fit_difficulty: ScoreValue = 6
+    fit_time_to_first_revenue_months: Optional[int] = None  # 1-60
+
+    # Knowledge signals — computed deterministically from wissen links, never LLM
+    mastery_leverage: float = Field(default=0.4, ge=0.0, le=1.0)
+    obsession_leverage: float = Field(default=0.4, ge=0.0, le=1.0)
+    cross_domain_flag: bool = False
+
+    # Gates (LLM-populated by enrich-intrinsic)
+    capital_class: Optional[Literal["bootstrappable", "seed", "vc_dependent"]] = None
+    regulation_class: Optional[Literal["unregulated", "low", "high"]] = None
+    willingness_to_pay: ScoreValue = 6
+    killer_flag: bool = False
+
+    # T5 signal
+    t5_risk_flag: bool = False
+
+    # Score metadata
+    score_v1: Optional[float] = None
+    score_history: List[ScoreHistoryEntry] = Field(default_factory=list)
 
     @field_validator("chancen", "wissen", mode="before")
     @classmethod
@@ -176,6 +211,15 @@ class IdeeNote(BaseNote):
     @classmethod
     def _coerce_customer_lists(cls, v: Any) -> list[str]:
         return _coerce_string_list(v)
+
+    @field_validator("score_history", mode="before")
+    @classmethod
+    def _parse_score_history(cls, v: Any) -> list:
+        if not v:
+            return []
+        if isinstance(v, list):
+            return v
+        return []
 
 
 class ChanceNote(BaseNote):
