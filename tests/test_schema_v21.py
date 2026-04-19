@@ -65,3 +65,36 @@ def test_killer_flag_set_directly():
         "killer_flag": True,
     })
     assert note.killer_flag is True
+
+
+def test_score_history_entry_is_frozen():
+    """ScoreHistoryEntry must be immutable after construction."""
+    import pytest
+    entry = ScoreHistoryEntry(date="2026-04-19", version="v1", score=3.91)
+    with pytest.raises(Exception):
+        entry.score = 999.0
+
+
+def test_fit_time_to_revenue_bounds():
+    """fit_time_to_first_revenue_months enforces 1-60 range."""
+    import pytest
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        IdeeNote.model_validate({
+            "id": "test",
+            "database": ["geschaeftsideen"],
+            "fit_time_to_first_revenue_months": 0,
+        })
+    with pytest.raises(ValidationError):
+        IdeeNote.model_validate({
+            "id": "test",
+            "database": ["geschaeftsideen"],
+            "fit_time_to_first_revenue_months": 61,
+        })
+    # Valid value should work
+    note = IdeeNote.model_validate({
+        "id": "test",
+        "database": ["geschaeftsideen"],
+        "fit_time_to_first_revenue_months": 12,
+    })
+    assert note.fit_time_to_first_revenue_months == 12

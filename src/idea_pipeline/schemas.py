@@ -98,7 +98,7 @@ def _coerce_string_list(values: Any) -> list[str]:
 class ScoreHistoryEntry(BaseModel):
     """One entry in the per-idea score history log. Append-only."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
 
     date: str                    # ISO date string, e.g. "2026-04-19"
     version: str                 # "v1" or "v2.1"
@@ -182,7 +182,7 @@ class IdeeNote(BaseNote):
 
     # v2.1 Fit
     fit_difficulty: ScoreValue = 6
-    fit_time_to_first_revenue_months: Optional[int] = None  # 1-60
+    fit_time_to_first_revenue_months: Optional[int] = Field(default=None, ge=1, le=60)
 
     # Knowledge signals — computed deterministically from wissen links, never LLM
     mastery_leverage: float = Field(default=0.4, ge=0.0, le=1.0)
@@ -212,14 +212,6 @@ class IdeeNote(BaseNote):
     def _coerce_customer_lists(cls, v: Any) -> list[str]:
         return _coerce_string_list(v)
 
-    @field_validator("score_history", mode="before")
-    @classmethod
-    def _parse_score_history(cls, v: Any) -> list:
-        if not v:
-            return []
-        if isinstance(v, list):
-            return v
-        return []
 
 
 class ChanceNote(BaseNote):
