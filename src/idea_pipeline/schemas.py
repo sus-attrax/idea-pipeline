@@ -129,7 +129,8 @@ class BaseNote(BaseModel):
     score_breakdown: Optional[dict] = None
     score_version: Optional[str] = None
     scored_at: Optional[str] = None
-    research_fidelity: Optional[str] = None  # tier0 | tier1 | tier2 | tier3
+    research_fidelity: Optional[str] = None  # tier1 … tier5
+    research_notes: Optional[str] = None    # T5 qualitative findings (markdown)
 
     @field_validator("database", mode="before")
     @classmethod

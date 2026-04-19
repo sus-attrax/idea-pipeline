@@ -692,57 +692,78 @@ def score_cmd(
 @app.command("research")
 def research_cmd(
     vault: Optional[Path] = _vault_option,
-    tier: int = typer.Option(1, "--tier", "-t", help="Research tier: 1=Tavily, 2=Firecrawl+Tavily"),
-    limit: int = typer.Option(10, "--limit", "-n", help="Number of top ideas to research"),
+    tier: int = typer.Option(1, "--tier", "-t", help="1=Tavily  2=Claude+WebSearch  3=Perplexity  4=Firecrawl  5=AutoResearch"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Max ideas to process (default: tier default)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without calling APIs or writing"),
+    force: bool = typer.Option(False, "--force", help="Re-run even if idea already has this tier or higher"),
 ) -> None:
-    """Enrich top ideas with external market research (T1: Tavily, T2: Firecrawl).
+    """Enrich ideas with external market research.
 
-    Picks top --limit ideas by current score, runs research, writes
-    market_size/market_potential/prevalence/market_awareness + research_fidelity
-    back to vault, then re-scores.
+    T1=Tavily (all 142), T2=Claude+WebSearch (top 50), T3=Perplexity (top 10),
+    T4=Firecrawl full-scrape (top 5), T5=AutoResearch 3-loop (top 5).
+    Idempotent: skips ideas already at this tier or higher unless --force.
     """
-    from idea_pipeline.research.web import FirecrawlResearcher, TavilyResearcher
+    import datetime
+
+    from idea_pipeline.research.web import MIN_CREDITS, TIER_LIMITS, get_researcher, tier_level
 
     vault_path = get_vault_path(vault)
     if not vault_path.is_dir():
         console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
         raise typer.Exit(1)
 
-    if tier not in (1, 2):
-        console.print(f"[red]✗ --tier must be 1 or 2 (got {tier})[/red]")
+    if tier not in range(1, 6):
+        console.print(f"[red]✗ --tier must be 1–5 (got {tier})[/red]")
         raise typer.Exit(1)
+
+    # T5 cost warning
+    if tier == 5 and not dry_run:
+        console.print(
+            "[bold yellow]⚠ T5 ist token-intensiv (~$2–5 pro Idee).[/bold yellow]"
+        )
+        if not typer.confirm("Fortfahren?", default=False):
+            raise typer.Exit(0)
+
+    effective_limit = limit if limit is not None else (TIER_LIMITS.get(tier) or 10)
 
     if dry_run:
         console.print("[bold yellow]Dry run[/bold yellow] — no APIs called, no files written.\n")
 
-    # Pick top-N by current score (dry=True → no writes)
     score_result = score_vault(vault_path, dry_run=True)
-    top_ideas = score_result.scored[:limit]
+    top_ideas = score_result.scored[:effective_limit]
 
-    if dry_run:
-        console.print(f"Would research {len(top_ideas)} ideas at tier {tier}:")
-        for idea_id, score in top_ideas:
-            console.print(f"  [cyan]{idea_id}[/cyan] (score={score:.3f})")
-        stats = cache_stats()
-        console.print(f"\n[dim]Cache: {stats['total']} entries ({stats['expired']} expired)[/dim]")
-        return
-
-    try:
-        researcher = TavilyResearcher() if tier == 1 else FirecrawlResearcher()
-    except RuntimeError as e:
-        console.print(f"[red]✗ {e}[/red]")
-        raise typer.Exit(1)
-
-    fidelity = f"tier{tier}"
     from idea_pipeline.schemas import IdeeNote
     from idea_pipeline.vault_io import list_notes as _list_notes
     from idea_pipeline.vault_io import write_note as _write_note
 
     ideen_by_id = {n.model.id: n for n in _list_notes(vault_path, IdeeNote).notes}
+
+    if dry_run:
+        console.print(f"Would research up to {len(top_ideas)} ideas at tier {tier}:")
+        skipped = 0
+        for idea_id, score in top_ideas:
+            vnote = ideen_by_id.get(idea_id)
+            current = tier_level(vnote.model.research_fidelity if vnote else None)
+            skip = not force and current >= tier
+            label = f"[dim](skip — already {vnote.model.research_fidelity})[/dim]" if skip else ""
+            skipped += skip
+            console.print(f"  [cyan]{idea_id}[/cyan] (score={score:.3f}) {label}")
+        stats = cache_stats()
+        console.print(f"\n[dim]{skipped} would be skipped · Cache: {stats['total']} entries[/dim]")
+        return
+
+    try:
+        researcher = get_researcher(tier)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[red]✗ {e}[/red]")
+        raise typer.Exit(1)
+
+    fidelity = f"tier{tier}"
     written = 0
+    skipped = 0
     errors = 0
-    report_entries: list[dict] = []  # for T2 review document
+    report_entries: list[dict] = []
+    t5_runs_dir = Path(__file__).resolve().parent.parent.parent / "runs"
 
     for rank, (idea_id, score) in enumerate(top_ideas, 1):
         vnote = ideen_by_id.get(idea_id)
@@ -750,14 +771,30 @@ def research_cmd(
             continue
         idea = vnote.model
 
-        # Credit gate for T2
-        if tier == 2:
-            from idea_pipeline.research.web import _MIN_CREDITS
+        # Idempotency: skip if already at this tier or higher
+        if not force and tier_level(idea.research_fidelity) >= tier:
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [dim]{idea_id} — skip "
+                f"({idea.research_fidelity})[/dim]"
+            )
+            skipped += 1
+            continue
+
+        # T5: require tier4 to be done first
+        if tier == 5 and tier_level(idea.research_fidelity) < 4:
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [yellow]{idea_id} — skip "
+                f"(T5 requires tier4 first)[/yellow]"
+            )
+            skipped += 1
+            continue
+
+        # Credit gate for T4 (Firecrawl)
+        if tier == 4:
             remaining = researcher.remaining_credits()
-            if remaining < _MIN_CREDITS:
+            if remaining < MIN_CREDITS:
                 console.print(
-                    f"\n[yellow]⚠ Only {remaining} Firecrawl credits left "
-                    f"(threshold {_MIN_CREDITS}) — stopping early.[/yellow]"
+                    f"\n[yellow]⚠ Only {remaining} Firecrawl credits left — stopping early.[/yellow]"
                 )
                 break
             console.print(
@@ -766,55 +803,79 @@ def research_cmd(
                 end=" ",
             )
         else:
-            console.print(f"  Researching [cyan]{idea_id}[/cyan] ...", end=" ")
+            console.print(
+                f"  [{rank}/{len(top_ideas)}] [cyan]{idea_id}[/cyan] ...", end=" "
+            )
 
         try:
-            result = researcher.research_idea(idea_id, idea.description or idea_id)
-            if tier == 2:
-                scores, narrative = result
+            if tier == 5:
+                existing_ctx = idea.research_notes or ""
+                scores, research_notes, _ = researcher.research_idea(
+                    idea_id, idea.description or idea_id, existing_ctx
+                )
             else:
-                scores, narrative = result, ""
+                result = researcher.research_idea(idea_id, idea.description or idea_id)
+                scores, narrative = result if isinstance(result, tuple) else (result, "")
+                research_notes = ""
         except Exception as e:
             console.print(f"[red]error: {e}[/red]")
             errors += 1
             continue
 
-        if not scores:
-            console.print("[dim]no data[/dim]")
-            continue
+        if tier == 5:
+            if not research_notes:
+                console.print("[dim]no data[/dim]")
+                continue
+            idea.research_notes = research_notes
+            idea.research_fidelity = fidelity
+            _write_note(vnote)
+            written += 1
+            console.print("[green]✓[/green]")
+            # Save per-idea markdown
+            t5_runs_dir.mkdir(exist_ok=True)
+            today = datetime.date.today().isoformat()
+            (t5_runs_dir / f"t5_{idea_id}_{today}.md").write_text(
+                research_notes, encoding="utf-8"
+            )
+        else:
+            if not scores:
+                console.print("[dim]no data[/dim]")
+                continue
+            for field, val in scores.items():
+                setattr(idea, field, val)
+            idea.research_fidelity = fidelity
+            _write_note(vnote)
+            written += 1
+            console.print(f"[green]✓[/green] {scores}")
 
-        for field, val in scores.items():
-            setattr(idea, field, val)
-        idea.research_fidelity = fidelity
-        _write_note(vnote)
-        written += 1
-        console.print(f"[green]✓[/green] {scores}")
+            if tier >= 2 and narrative:
+                wissen_links = idea.wissen or []
+                report_entries.append({
+                    "rank": rank,
+                    "idea_id": idea_id,
+                    "score": score,
+                    "scores": scores,
+                    "narrative": narrative,
+                    "description": idea.description or "",
+                    "wissen": [
+                        str(w).strip("[]").replace("[[", "").replace("]]", "")
+                        for w in wissen_links
+                    ],
+                })
 
-        if tier == 2 and narrative:
-            wissen_links = idea.wissen or []
-            report_entries.append({
-                "rank": rank,
-                "idea_id": idea_id,
-                "score": score,
-                "scores": scores,
-                "narrative": narrative,
-                "description": idea.description or "",
-                "wissen": [str(w).strip("[]").replace("[[", "").replace("]]", "") for w in wissen_links],
-            })
+    if tier != 5:
+        console.print("\nRe-scoring vault ...")
+        score_vault(vault_path)
 
-    console.print(f"\nRe-scoring vault ...")
-    score_vault(vault_path)
-
-    # Write T2 review report
+    # Write narrative review report (T2–T4)
     if report_entries:
-        import datetime
         reports_dir = Path(__file__).resolve().parent.parent.parent / "reports"
         reports_dir.mkdir(exist_ok=True)
         today = datetime.date.today().isoformat()
-        report_path = reports_dir / f"t2_review_{today}.md"
+        report_path = reports_dir / f"t{tier}_review_{today}.md"
         lines = [
-            f"# T2 Market Research Review — {today}\n",
-            f"Generated by `ideapipe research --tier 2 --limit {limit}`\n",
+            f"# T{tier} Market Research Review — {today}\n",
+            f"Generated by `ideapipe research --tier {tier} --limit {effective_limit}`\n",
             "---\n",
         ]
         for e in report_entries:
@@ -828,7 +889,7 @@ def research_cmd(
                 f"prevalence={sc.get('prevalence','—')}  "
                 f"market_awareness={sc.get('market_awareness','—')}\n",
                 f"**Research findings:**\n{e['narrative']}\n",
-                f"> *Idea description:* {e['description'][:300]}\n",
+                f"> *Description:* {e['description'][:300]}\n",
                 "\n---\n",
             ]
         report_path.write_text("\n".join(lines), encoding="utf-8")
@@ -836,7 +897,7 @@ def research_cmd(
 
     stats = cache_stats()
     console.print(
-        f"\nDone. {written} enriched · {errors} errors · "
+        f"\nDone. {written} enriched · {skipped} skipped · {errors} errors · "
         f"cache: {stats['total']} entries"
     )
 
