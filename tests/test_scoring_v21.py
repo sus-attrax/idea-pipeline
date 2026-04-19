@@ -130,6 +130,16 @@ def test_score_fit_cross_domain_bonus():
     assert _score_fit(with_cd, weights) > _score_fit(base, weights)
 
 
+def test_knowledge_signals_single_node_both_high_no_cross_domain():
+    """A single wissen node with both high mastery AND high obsession is NOT cross-domain."""
+    from idea_pipeline.scoring import compute_idea_knowledge_signals
+    # This node has confidence=1 (high mastery) and enjoyment=1 (high obsession) — same node
+    w = _make_wissen(confidence=1, credibility=1, contacts=1, enjoyment=1)
+    signals = compute_idea_knowledge_signals([w], [w])
+    # Single node cannot be cross-domain — needs separate nodes for mastery vs obsession
+    assert signals["cross_domain_flag"] is False
+
+
 def test_score_vault_dry_run():
     """score_vault dry_run returns scored list without writing."""
     from idea_pipeline.scoring import score_vault

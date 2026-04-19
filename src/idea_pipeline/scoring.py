@@ -96,13 +96,15 @@ def compute_idea_knowledge_signals(
     obsession_avg = sum(obsessions) / len(obsessions)
 
     threshold = cfg["cross_domain"]["high_threshold"]
-    has_high_mastery = any(m >= threshold for m in masteries)
-    has_high_obsession = any(o >= threshold for o in obsessions)
+    high_mastery_idxs = {i for i, m in enumerate(masteries) if m >= threshold}
+    high_obsession_idxs = {i for i, o in enumerate(obsessions) if o >= threshold}
+    # Cross-domain requires that mastery and obsession come from different nodes
+    cross_domain = bool(high_mastery_idxs - high_obsession_idxs) and bool(high_obsession_idxs - high_mastery_idxs)
 
     return {
         "mastery_leverage": round(mastery_avg, 4),
         "obsession_leverage": round(obsession_avg, 4),
-        "cross_domain_flag": has_high_mastery and has_high_obsession,
+        "cross_domain_flag": cross_domain,
     }
 
 
