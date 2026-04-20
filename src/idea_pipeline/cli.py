@@ -755,8 +755,7 @@ def research_cmd(
     scores_by_id = dict(score_result.scored)
     vault_size = len(scores_by_id)
     effective_limit = resolve_tier_limit(tier, vault_size, limit)
-    if limit is None:
-        console.print(f"T{tier} limit: {effective_limit} ideas (vault: {vault_size} ideas)")
+    console.print(f"T{tier} limit: {effective_limit} ideas (vault: {vault_size} ideas)")
     top_ideas = [(idea_id, sc) for idea_id, sc in score_result.scored if idea_id not in exclude_ids][:effective_limit]
     # Force-add included ideas not already in top_ideas
     top_idea_ids = {idea_id for idea_id, _ in top_ideas}
