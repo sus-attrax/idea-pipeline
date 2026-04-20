@@ -715,6 +715,8 @@ def research_cmd(
     limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Max ideas to process (default: tier default)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview without calling APIs or writing"),
     force: bool = typer.Option(False, "--force", help="Re-run even if idea already has this tier or higher"),
+    exclude: Optional[str] = typer.Option(None, "--exclude", help="Comma-separated idea IDs to skip"),
+    include: Optional[str] = typer.Option(None, "--include", help="Comma-separated idea IDs to force-add (appended after top-N)"),
 ) -> None:
     """Enrich ideas with external market research.
 
@@ -748,8 +750,17 @@ def research_cmd(
     if dry_run:
         console.print("[bold yellow]Dry run[/bold yellow] — no APIs called, no files written.\n")
 
+    exclude_ids = {e.strip() for e in exclude.split(",")} if exclude else set()
+    include_ids = [e.strip() for e in include.split(",")] if include else []
+
     score_result = score_vault(vault_path, dry_run=True)
-    top_ideas = score_result.scored[:effective_limit]
+    scores_by_id = dict(score_result.scored)
+    top_ideas = [(idea_id, sc) for idea_id, sc in score_result.scored if idea_id not in exclude_ids][:effective_limit]
+    # Force-add included ideas not already in top_ideas
+    top_idea_ids = {idea_id for idea_id, _ in top_ideas}
+    for inc_id in include_ids:
+        if inc_id not in top_idea_ids and inc_id in scores_by_id:
+            top_ideas.append((inc_id, scores_by_id[inc_id]))
 
     from idea_pipeline.schemas import IdeeNote
     from idea_pipeline.vault_io import list_notes as _list_notes
