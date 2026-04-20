@@ -708,6 +708,67 @@ def score_cmd(
     console.print(f"\n[bold]{len(result.scored)} ideas scored[/bold]")
 
 
+def _auto_commit_and_push(tier: int, n_researched: int, project_root: Path) -> None:
+    """Generate tier leaderboard, git add, commit, and push."""
+    import subprocess
+
+    leaderboard_path = project_root / f"LEADERBOARD_T{tier}.md"
+    console.print(f"\n[bold]Auto-push:[/bold] generating {leaderboard_path.name} ...")
+
+    # Generate the leaderboard via subprocess (most reliable, avoids typer context issues)
+    gen_result = subprocess.run(
+        ["python", "-m", "idea_pipeline", "report", f"--min-tier={tier}", f"--out={leaderboard_path}"],
+        capture_output=True,
+        text=True,
+        cwd=str(project_root),
+    )
+    if gen_result.returncode != 0:
+        # Try with the installed entry-point name
+        gen_result = subprocess.run(
+            ["ideapipe", "report", f"--min-tier={tier}", f"--out={leaderboard_path}"],
+            capture_output=True,
+            text=True,
+            cwd=str(project_root),
+        )
+    if gen_result.returncode != 0:
+        console.print(f"[yellow]⚠ Could not generate leaderboard: {gen_result.stderr.strip()}[/yellow]")
+    else:
+        console.print(f"  [green]✓[/green] {leaderboard_path.name} written")
+
+    vault_dir = Path.home() / "vaults" / "idea-validation"
+
+    add_result = subprocess.run(
+        ["git", "add", str(leaderboard_path), str(vault_dir)],
+        capture_output=True,
+        text=True,
+        cwd=str(project_root),
+    )
+    if add_result.returncode != 0:
+        console.print(f"[yellow]⚠ git add warning: {add_result.stderr.strip()}[/yellow]")
+
+    commit_result = subprocess.run(
+        ["git", "commit", "-m", f"research: T{tier} run — {n_researched} ideas researched"],
+        capture_output=True,
+        text=True,
+        cwd=str(project_root),
+    )
+    if commit_result.returncode != 0:
+        console.print(f"[yellow]⚠ git commit: {commit_result.stdout.strip() or commit_result.stderr.strip()}[/yellow]")
+    else:
+        console.print(f"  [green]✓[/green] committed: research: T{tier} run — {n_researched} ideas researched")
+
+    push_result = subprocess.run(
+        ["git", "push"],
+        capture_output=True,
+        text=True,
+        cwd=str(project_root),
+    )
+    if push_result.returncode != 0:
+        console.print(f"[yellow]⚠ git push failed: {push_result.stderr.strip()}[/yellow]")
+    else:
+        console.print(f"  [green]✓[/green] pushed to remote")
+
+
 @app.command("research")
 def research_cmd(
     vault: Optional[Path] = _vault_option,
@@ -717,6 +778,7 @@ def research_cmd(
     force: bool = typer.Option(False, "--force", help="Re-run even if idea already has this tier or higher"),
     exclude: Optional[str] = typer.Option(None, "--exclude", help="Comma-separated idea IDs to skip"),
     include: Optional[str] = typer.Option(None, "--include", help="Comma-separated idea IDs to force-add (appended after top-N)"),
+    no_auto_push: bool = typer.Option(False, "--no-auto-push", help="Skip automatic leaderboard generation and git push after run"),
 ) -> None:
     """Enrich ideas with external market research.
 
@@ -925,6 +987,11 @@ def research_cmd(
             ]
         report_path.write_text("\n".join(lines), encoding="utf-8")
         console.print(f"\n[bold]Review report:[/bold] {report_path}")
+
+    # Auto-push: generate tier leaderboard + commit + push (T2+ only, not dry-run, not suppressed)
+    if not dry_run and not no_auto_push and tier >= 2 and written > 0:
+        project_root = Path(__file__).resolve().parent.parent.parent
+        _auto_commit_and_push(tier, written, project_root)
 
     stats = cache_stats()
     console.print(
