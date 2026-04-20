@@ -937,10 +937,13 @@ def report_cmd(
     vault: Optional[Path] = _vault_option,
     out: Path = typer.Option(Path("LEADERBOARD.md"), "--out", "-o", help="Output markdown file"),
     version: str = typer.Option("v2.1", "--version", help="v1 or v2.1 column layout"),
+    min_tier: Optional[int] = typer.Option(None, "--min-tier", help="Only include ideas at this research tier or higher (1–5)"),
 ) -> None:
     """Write a ranked markdown leaderboard of all scored ideas."""
     import datetime
     import yaml
+
+    from idea_pipeline.research.web import tier_level
 
     vault_path = get_vault_path(vault)
     if not vault_path.is_dir():
@@ -965,6 +968,8 @@ def report_cmd(
         if not any("geschaeftsideen" in str(d) for d in db):
             continue
         if meta.get("score") is None:
+            continue
+        if min_tier is not None and tier_level(meta.get("research_fidelity")) < min_tier:
             continue
         ideas.append({"id": f.stem, **meta})
 
