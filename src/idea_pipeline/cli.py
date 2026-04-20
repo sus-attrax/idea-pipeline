@@ -708,34 +708,27 @@ def score_cmd(
     console.print(f"\n[bold]{len(result.scored)} ideas scored[/bold]")
 
 
-def _auto_commit_and_push(tier: int, n_researched: int, project_root: Path) -> None:
+def _auto_commit_and_push(tier: int, n_researched: int, project_root: Path, vault_path: Path) -> None:
     """Generate tier leaderboard, git add, commit, and push."""
     import subprocess
 
     leaderboard_path = project_root / f"LEADERBOARD_T{tier}.md"
     console.print(f"\n[bold]Auto-push:[/bold] generating {leaderboard_path.name} ...")
 
-    # Generate the leaderboard via subprocess (most reliable, avoids typer context issues)
+    # Generate the leaderboard via subprocess using the same Python interpreter
     gen_result = subprocess.run(
-        ["python", "-m", "idea_pipeline", "report", f"--min-tier={tier}", f"--out={leaderboard_path}"],
+        [sys.executable, "-m", "idea_pipeline", "report",
+         f"--min-tier={tier}", f"--out=LEADERBOARD_T{tier}.md"],
         capture_output=True,
         text=True,
         cwd=str(project_root),
     )
     if gen_result.returncode != 0:
-        # Try with the installed entry-point name
-        gen_result = subprocess.run(
-            ["ideapipe", "report", f"--min-tier={tier}", f"--out={leaderboard_path}"],
-            capture_output=True,
-            text=True,
-            cwd=str(project_root),
-        )
-    if gen_result.returncode != 0:
         console.print(f"[yellow]⚠ Could not generate leaderboard: {gen_result.stderr.strip()}[/yellow]")
     else:
         console.print(f"  [green]✓[/green] {leaderboard_path.name} written")
 
-    vault_dir = Path.home() / "vaults" / "idea-validation"
+    vault_dir = vault_path
 
     add_result = subprocess.run(
         ["git", "add", str(leaderboard_path), str(vault_dir)],
@@ -991,7 +984,7 @@ def research_cmd(
     # Auto-push: generate tier leaderboard + commit + push (T2+ only, not dry-run, not suppressed)
     if not dry_run and not no_auto_push and tier >= 2 and written > 0:
         project_root = Path(__file__).resolve().parent.parent.parent
-        _auto_commit_and_push(tier, written, project_root)
+        _auto_commit_and_push(tier, written, project_root, vault_path)
 
     stats = cache_stats()
     console.print(
