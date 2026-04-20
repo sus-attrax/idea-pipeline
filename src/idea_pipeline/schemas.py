@@ -164,6 +164,7 @@ class IdeeNote(BaseNote):
     # v1 intrinsic fields — kept for backward compat, not read by v2.1 scoring
     market_size: ScoreValue = 6
     market_potential: ScoreValue = 6
+    market_awareness: ScoreValue = 6
     impact: ScoreValue = 6
     difficulty: ScoreValue = 6
     time_investment: ScoreValue = 6
