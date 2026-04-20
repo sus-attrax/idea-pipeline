@@ -1535,5 +1535,321 @@ def generate_cmd(
             console.print("Run [bold]ideapipe score --version v2.1[/bold] to score them.")
 
 
+@app.command("select-hypotheses")
+def select_hypotheses(
+    vault: Optional[Path] = _vault_option,
+    n: int = typer.Option(8, "--n", help="Number of hypotheses to select"),
+    min_tier: int = typer.Option(4, "--min-tier", help="Minimum research fidelity tier (1-5)"),
+    out: Path = typer.Option(Path("HYPOTHESES.md"), "--out", "-o", help="Output markdown file"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print selected IDs/domains without writing file"),
+) -> None:
+    """Select 5-10 diverse hypotheses from the top-scored ideas using domain diversity.
+
+    Classifies each idea into a domain using Claude Haiku, then selects
+    one idea per domain (greedy diversity) to produce a rich HYPOTHESES.md.
+    """
+    import datetime
+    import json
+
+    import anthropic
+
+    from idea_pipeline.research.sources.base import tier_level
+    from idea_pipeline.vault_io import list_notes as _list_notes
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    # --- 1. Load ideas with research_fidelity >= min_tier, sorted by score desc ---
+    all_notes = _list_notes(vault_path, IdeeNote).notes
+    eligible: list[IdeeNote] = [
+        n.model for n in all_notes
+        if n.model.score is not None and tier_level(n.model.research_fidelity) >= min_tier
+    ]
+    eligible.sort(key=lambda m: m.score or 0, reverse=True)
+
+    if not eligible:
+        console.print(f"[yellow]No ideas with research_fidelity >= tier{min_tier} found.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"[bold]select-hypotheses[/bold]: {len(eligible)} eligible ideas (tier{min_tier}+), selecting {n} diverse picks\n")
+
+    # --- 2. Classify into domains using Claude Haiku batch calls ---
+    DOMAINS = [
+        "B2B_SaaS", "B2C_App", "Marketplace", "DeepTech", "Sustainability",
+        "BioTech", "AgriTech", "FinTech", "EdTech", "HealthTech",
+        "Hardware", "Services", "Other",
+    ]
+    domain_cache: dict[str, str] = {}
+
+    haiku_client = anthropic.Anthropic()
+
+    def classify_batch(batch: list[IdeeNote]) -> dict[str, str]:
+        """Send up to 10 ideas to Haiku, get {id: domain} back."""
+        ideas_payload = {
+            m.id: (m.description or m.id)[:300]
+            for m in batch
+        }
+        prompt = (
+            "Given these idea titles/descriptions, classify each into exactly one of: "
+            + ", ".join(DOMAINS)
+            + ".\nReturn ONLY valid JSON in the format: {\"idea_id\": \"domain\", ...}\n\n"
+            + "Ideas:\n"
+            + json.dumps(ideas_payload, ensure_ascii=False)
+        )
+        try:
+            resp = haiku_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=512,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = resp.content[0].text.strip()
+            # Strip markdown code fences if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            data = json.loads(text)
+            # Validate domains
+            result = {}
+            for idea_id, domain in data.items():
+                result[idea_id] = domain if domain in DOMAINS else "Other"
+            return result
+        except Exception as e:
+            console.print(f"[yellow]Haiku classification error: {e} — falling back to 'Other'[/yellow]")
+            return {m.id: "Other" for m in batch}
+
+    console.print("Classifying ideas into domains via Claude Haiku...")
+    batch_size = 10
+    for i in range(0, len(eligible), batch_size):
+        batch = eligible[i:i + batch_size]
+        # Skip already cached
+        uncached = [m for m in batch if m.id not in domain_cache]
+        if uncached:
+            classifications = classify_batch(uncached)
+            domain_cache.update(classifications)
+        for m in batch:
+            if m.id not in domain_cache:
+                domain_cache[m.id] = "Other"
+
+    # --- 3. Greedy diversity selection ---
+    selected: list[IdeeNote] = []
+    seen_domains: set[str] = set()
+
+    for idea in eligible:
+        domain = domain_cache.get(idea.id, "Other")
+        if domain not in seen_domains:
+            selected.append(idea)
+            seen_domains.add(domain)
+            if len(selected) >= n:
+                break
+
+    # --- 4. Fallback: allow repeats if not enough unique domains ---
+    if len(selected) < n:
+        remaining = [m for m in eligible if m not in selected]
+        for idea in remaining:
+            selected.append(idea)
+            if len(selected) >= n:
+                break
+
+    # --- Dry run: just print selected IDs and domains ---
+    if dry_run:
+        console.print(f"\n[bold]Would select {len(selected)} hypotheses:[/bold]\n")
+        for i, idea in enumerate(selected, 1):
+            domain = domain_cache.get(idea.id, "Other")
+            console.print(f"  [cyan]{i}.[/cyan] [bold]{idea.id}[/bold]  domain=[yellow]{domain}[/yellow]  score={idea.score:.4f}  tier={idea.research_fidelity}")
+        return
+
+    # --- 5. Load chance + wissen notes for descriptions ---
+    chance_notes_by_id = {
+        n.model.id: n.model
+        for n in _list_notes(vault_path, ChanceNote).notes
+    }
+    wissen_notes_by_id = {
+        n.model.id: n.model
+        for n in _list_notes(vault_path, WissenNote).notes
+    }
+
+    # --- 6. Pull cached narratives (T2=claude_search, T3=perplexity, T4=firecrawl) ---
+    def get_cached_narrative(idea_id: str, fidelity: str | None) -> str:
+        """Try to retrieve the research narrative from the SQLite cache."""
+        import sqlite3 as _sqlite3
+        try:
+            from idea_pipeline.research.cache import _DB_PATH, _TTL_SECONDS, _cache_key
+            import time as _time
+
+            source_map = {
+                "tier2": ("claude_search_v1", f"t2:{idea_id}"),
+                "tier3": ("perplexity_v1", f"t3:{idea_id}"),
+                "tier4": ("firecrawl_v2_search", f"t4:{idea_id}"),
+            }
+            tier_key = fidelity or ""
+            if tier_key not in source_map:
+                return ""
+            source, query = source_map[tier_key]
+            # Try direct key first
+            from idea_pipeline.research.cache import cache_get
+            result = cache_get(query, source)
+            if result:
+                return result.get("narrative", "")
+            # T4 also has a separate firecrawl_v2 source for individual scrapes
+            if tier_key == "tier4":
+                result2 = cache_get(f"t4:{idea_id}", "firecrawl_v1")
+                if result2:
+                    return result2.get("narrative", "")
+            return ""
+        except Exception:
+            return ""
+
+    def get_all_narratives(idea: IdeeNote) -> str:
+        """Concatenate all available research narratives for an idea."""
+        parts = []
+        fidelity = idea.research_fidelity or ""
+        tier_n = tier_level(fidelity)
+
+        # T2 narrative
+        if tier_n >= 2:
+            n2 = get_cached_narrative(idea.id, "tier2")
+            if n2:
+                parts.append(f"**T2 (Claude Web Search):** {n2}")
+
+        # T3 narrative
+        if tier_n >= 3:
+            n3 = get_cached_narrative(idea.id, "tier3")
+            if n3:
+                parts.append(f"**T3 (Perplexity Sonar):** {n3}")
+
+        # T4 narrative — pull from T4 review report file as fallback
+        if tier_n >= 4:
+            n4 = get_cached_narrative(idea.id, "tier4")
+            if not n4:
+                # Parse from report file
+                try:
+                    repo_root = Path(__file__).resolve().parent.parent.parent
+                    reports_dir = repo_root / "reports"
+                    for rfile in sorted(reports_dir.glob("t4_review_*.md"), reverse=True):
+                        text = rfile.read_text(encoding="utf-8")
+                        # Find section for this idea
+                        marker = f"## #"
+                        sections = text.split(marker)
+                        for sec in sections[1:]:
+                            if idea.id in sec[:80]:
+                                rf_start = sec.find("**Research findings:**\n")
+                                if rf_start >= 0:
+                                    rf_text = sec[rf_start + len("**Research findings:**\n"):]
+                                    rf_text = rf_text.split("\n>")[0].strip()
+                                    n4 = rf_text
+                                break
+                        if n4:
+                            break
+                except Exception:
+                    pass
+            if n4:
+                parts.append(f"**T4 (Firecrawl Deep Research):** {n4}")
+
+        # T5 research_notes
+        if idea.research_notes:
+            parts.append(f"**T5 (AutoResearch):** {idea.research_notes}")
+
+        return "\n\n".join(parts) if parts else "_No research narrative available yet._"
+
+    def fmt_score_breakdown(sb: dict | None) -> str:
+        if not sb:
+            return "_No breakdown available._"
+        lines = []
+        if "market_score" in sb:
+            lines.append(f"Market attractiveness: {sb['market_score']:.2f}/6")
+        if "fit_score" in sb:
+            lines.append(f"Founder fit: {sb['fit_score']:.2f}/6")
+        if "chance_score" in sb:
+            lines.append(f"Problem strength: {sb['chance_score']:.2f}/6")
+        if "attractiveness_score" in sb:
+            lines.append(f"Idea attractiveness: {sb['attractiveness_score']:.2f}/6")
+        if "willingness_to_pay" in sb:
+            lines.append(f"Willingness to pay: {sb['willingness_to_pay']}/6 (1=high)")
+        if sb.get("killer_flag"):
+            lines.append("⚠ Killer flag: vc_dependent + high regulation — high execution risk")
+        return " | ".join(lines) if lines else "_No breakdown_"
+
+    def recommended_path(capital_class: str | None) -> str:
+        if capital_class == "bootstrappable":
+            return "Self-fund → validate MVP → grow organically"
+        elif capital_class == "seed":
+            return "Pre-seed angels → MVP → seed round"
+        elif capital_class == "vc_dependent":
+            return "Validate core hypothesis deeply before fundraising; needs institutional capital"
+        return "Assess capital needs before committing to a path"
+
+    # --- 7. Generate HYPOTHESES.md ---
+    today = datetime.date.today().isoformat()
+    lines: list[str] = [
+        "# Idea Pipeline — Working Hypotheses",
+        f"Generated: {today} | Source: T{min_tier}+ leaderboard | Selected: {len(selected)} diverse ideas",
+        "",
+        "---",
+        "",
+    ]
+
+    for i, idea in enumerate(selected, 1):
+        domain = domain_cache.get(idea.id, "Other")
+        sb = idea.score_breakdown or {}
+
+        # Linked problems
+        chance_lines: list[str] = []
+        for cid in (idea.chancen or []):
+            c = chance_notes_by_id.get(cid)
+            desc = (c.description or "").strip() if c else ""
+            chance_lines.append(f"- **{cid}**: {desc[:120]}" if desc else f"- {cid}")
+
+        # Linked wissen
+        wissen_lines: list[str] = []
+        for wid in (idea.wissen or []):
+            wissen_lines.append(f"- {wid}")
+
+        # First adopters
+        fa_str = ", ".join(idea.first_adopters) if idea.first_adopters else "TBD"
+
+        narratives = get_all_narratives(idea)
+
+        lines += [
+            f"## Hypothesis #{i}: {idea.id}",
+            f"**Score:** {idea.score:.4f} | **Tier:** T{tier_level(idea.research_fidelity)} | **Domain:** {domain}",
+            f"**Capital:** {idea.capital_class or '—'} | **Regulation:** {idea.regulation_class or '—'}",
+            "",
+            "### Why this hypothesis?",
+            fmt_score_breakdown(sb),
+            "",
+            "### What we know (Research Findings)",
+            narratives,
+            "",
+            "### Linked Problems",
+            "\n".join(chance_lines) if chance_lines else "_No linked problems._",
+            "",
+            "### Founder Fit",
+            f"Mastery: {idea.mastery_leverage:.0%} | Obsession: {idea.obsession_leverage:.0%} | Cross-domain: {idea.cross_domain_flag}",
+            f"Relevant knowledge: {', '.join(idea.wissen) if idea.wissen else '—'}",
+            "",
+            "### Recommended Next Steps",
+            "- [ ] Autoresearch (T5): deepen counter-arguments and competitor analysis",
+            "- [ ] Expert interview: identify 3 domain experts via LinkedIn/network",
+            f"- [ ] Customer discovery: 5 conversations with {fa_str}",
+            f"- [ ] Build/buy/partner decision: {idea.capital_class or '—'} → {recommended_path(idea.capital_class)}",
+            "",
+            "---",
+            "",
+        ]
+
+    # Resolve output path relative to repo root if not absolute
+    if not out.is_absolute():
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        out = repo_root / out
+
+    out.write_text("\n".join(lines), encoding="utf-8")
+    console.print(f"\n[green]✓[/green] {len(selected)} hypotheses written to [bold]{out}[/bold]")
+    console.print("\n[bold]Selected:[/bold]")
+    for i, idea in enumerate(selected, 1):
+        domain = domain_cache.get(idea.id, "Other")
+        console.print(f"  {i}. [cyan]{idea.id}[/cyan]  [{domain}]  score={idea.score:.4f}")
+
+
 if __name__ == "__main__":
     app()
