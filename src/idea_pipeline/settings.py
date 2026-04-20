@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 _DEFAULT_VAULT = "~/vaults/idea-validation"
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 def get_vault_path(override: str | Path | None = None) -> Path:
@@ -25,3 +29,13 @@ def get_vault_path(override: str | Path | None = None) -> Path:
         return Path(override).expanduser().resolve()
     raw = os.environ.get("IDEAPIPE_VAULT", _DEFAULT_VAULT)
     return Path(raw).expanduser().resolve()
+
+
+def load_tiers_config() -> dict[str, Any]:
+    """Load tier limits from config/tiers.yaml."""
+    path = _PROJECT_ROOT / "config" / "tiers.yaml"
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f)
+    return data.get("tiers", {})

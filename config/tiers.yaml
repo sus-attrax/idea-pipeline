@@ -1,0 +1,18 @@
+# Tier limits — n = absolute max, pct = fraction of vault size
+# Resolved limit = min(n, pct * vault_size) when both set
+# --limit flag always overrides
+tiers:
+  t1:
+    limit: null          # all ideas
+  t2:
+    limit: 100
+    pct: 0.50
+  t3:
+    limit: 50
+    pct: 0.25
+  t4:
+    limit: 25
+    pct: 0.12
+  t5:
+    limit: 5
+    pct: 0.03

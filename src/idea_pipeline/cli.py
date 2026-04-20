@@ -726,7 +726,7 @@ def research_cmd(
     """
     import datetime
 
-    from idea_pipeline.research.web import MIN_CREDITS, TIER_LIMITS, get_researcher, tier_level
+    from idea_pipeline.research.web import MIN_CREDITS, TIER_LIMITS, get_researcher, resolve_tier_limit, tier_level
 
     vault_path = get_vault_path(vault)
     if not vault_path.is_dir():
@@ -745,8 +745,6 @@ def research_cmd(
         if not typer.confirm("Fortfahren?", default=False):
             raise typer.Exit(0)
 
-    effective_limit = limit if limit is not None else (TIER_LIMITS.get(tier) or 10)
-
     if dry_run:
         console.print("[bold yellow]Dry run[/bold yellow] — no APIs called, no files written.\n")
 
@@ -755,6 +753,10 @@ def research_cmd(
 
     score_result = score_vault(vault_path, dry_run=True)
     scores_by_id = dict(score_result.scored)
+    vault_size = len(scores_by_id)
+    effective_limit = resolve_tier_limit(tier, vault_size, limit)
+    if limit is None:
+        console.print(f"T{tier} limit: {effective_limit} ideas (vault: {vault_size} ideas)")
     top_ideas = [(idea_id, sc) for idea_id, sc in score_result.scored if idea_id not in exclude_ids][:effective_limit]
     # Force-add included ideas not already in top_ideas
     top_idea_ids = {idea_id for idea_id, _ in top_ideas}

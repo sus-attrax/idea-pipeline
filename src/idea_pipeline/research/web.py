@@ -26,6 +26,32 @@ _RESEARCHERS = {
 TIER_LIMITS = {1: None, 2: 50, 3: 10, 4: 5, 5: 5}
 
 
+def resolve_tier_limit(tier: int, vault_size: int, explicit_limit: int | None) -> int:
+    """Resolve effective research limit for a tier.
+
+    Priority: explicit CLI --limit > config/tiers.yaml > vault_size (no limit).
+    """
+    if explicit_limit is not None:
+        return explicit_limit
+    try:
+        from idea_pipeline.settings import load_tiers_config
+        tiers_cfg = load_tiers_config()
+        key = f"t{tier}"
+        cfg = tiers_cfg.get(key, {})
+        n = cfg.get("limit")
+        pct = cfg.get("pct")
+        if n is None and pct is None:
+            return vault_size
+        candidates = []
+        if n is not None:
+            candidates.append(n)
+        if pct is not None:
+            candidates.append(int(vault_size * pct))
+        return min(candidates)
+    except Exception:
+        return vault_size
+
+
 def get_researcher(tier: int):
     cls = _RESEARCHERS.get(tier)
     if cls is None:
@@ -35,6 +61,7 @@ def get_researcher(tier: int):
 
 __all__ = [
     "get_researcher",
+    "resolve_tier_limit",
     "tier_level",
     "TIER_LIMITS",
     "RESEARCH_FIELDS",
