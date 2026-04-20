@@ -1541,7 +1541,7 @@ def select_hypotheses(
     n: int = typer.Option(8, "--n", help="Number of hypotheses to select"),
     min_tier: int = typer.Option(4, "--min-tier", help="Minimum research fidelity tier (1-5)"),
     out: Path = typer.Option(Path("HYPOTHESES.md"), "--out", "-o", help="Output markdown file"),
-    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Print selected IDs/domains without writing file"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without calling APIs or writing"),
 ) -> None:
     """Select 5-10 diverse hypotheses from the top-scored ideas using domain diversity.
 
@@ -1564,8 +1564,8 @@ def select_hypotheses(
     # --- 1. Load ideas with research_fidelity >= min_tier, sorted by score desc ---
     all_notes = _list_notes(vault_path, IdeeNote).notes
     eligible: list[IdeeNote] = [
-        n.model for n in all_notes
-        if n.model.score is not None and tier_level(n.model.research_fidelity) >= min_tier
+        vn.model for vn in all_notes
+        if vn.model.score is not None and tier_level(vn.model.research_fidelity) >= min_tier
     ]
     eligible.sort(key=lambda m: m.score or 0, reverse=True)
 
@@ -1574,6 +1574,17 @@ def select_hypotheses(
         raise typer.Exit(0)
 
     console.print(f"[bold]select-hypotheses[/bold]: {len(eligible)} eligible ideas (tier{min_tier}+), selecting {n} diverse picks\n")
+
+    # --- Dry run: print preview and return without calling any API ---
+    if dry_run:
+        console.print(f"[yellow]Dry run[/yellow] — no APIs called, no files written.\n")
+        console.print(f"select-hypotheses: {len(eligible)} eligible ideas (tier{min_tier}+)")
+        console.print(f"Would call Claude Haiku to classify into domains, then select {n} diverse picks.")
+        console.print("Top eligible idea IDs (would-select preview):")
+        for i, idea in enumerate(eligible[:n], 1):
+            console.print(f"  [cyan]{i}.[/cyan] [bold]{idea.id}[/bold]  score={idea.score:.4f}  tier={idea.research_fidelity}")
+        console.print("\nPass without --dry-run to generate HYPOTHESES.md")
+        return
 
     # --- 2. Classify into domains using Claude Haiku batch calls ---
     DOMAINS = [
@@ -1661,41 +1672,32 @@ def select_hypotheses(
 
     # --- 5. Load chance + wissen notes for descriptions ---
     chance_notes_by_id = {
-        n.model.id: n.model
-        for n in _list_notes(vault_path, ChanceNote).notes
+        vn.model.id: vn.model
+        for vn in _list_notes(vault_path, ChanceNote).notes
     }
     wissen_notes_by_id = {
-        n.model.id: n.model
-        for n in _list_notes(vault_path, WissenNote).notes
+        vn.model.id: vn.model
+        for vn in _list_notes(vault_path, WissenNote).notes
     }
 
     # --- 6. Pull cached narratives (T2=claude_search, T3=perplexity, T4=firecrawl) ---
     def get_cached_narrative(idea_id: str, fidelity: str | None) -> str:
         """Try to retrieve the research narrative from the SQLite cache."""
-        import sqlite3 as _sqlite3
         try:
-            from idea_pipeline.research.cache import _DB_PATH, _TTL_SECONDS, _cache_key
-            import time as _time
+            from idea_pipeline.research.cache import cache_get
 
             source_map = {
                 "tier2": ("claude_search_v1", f"t2:{idea_id}"),
                 "tier3": ("perplexity_v1", f"t3:{idea_id}"),
-                "tier4": ("firecrawl_v2_search", f"t4:{idea_id}"),
+                "tier4": ("firecrawl_v2", f"t4:{idea_id}"),
             }
             tier_key = fidelity or ""
             if tier_key not in source_map:
                 return ""
             source, query = source_map[tier_key]
-            # Try direct key first
-            from idea_pipeline.research.cache import cache_get
             result = cache_get(query, source)
             if result:
                 return result.get("narrative", "")
-            # T4 also has a separate firecrawl_v2 source for individual scrapes
-            if tier_key == "tier4":
-                result2 = cache_get(f"t4:{idea_id}", "firecrawl_v1")
-                if result2:
-                    return result2.get("narrative", "")
             return ""
         except Exception:
             return ""
