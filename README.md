@@ -1,78 +1,131 @@
-# idea-pipeline
+# Idea Pipeline
 
-Business idea validation & generation pipeline based on an Obsidian vault.
+A multi-tier research and scoring system for founder-specific idea validation. Ingests business ideas, enriches them through progressive API tiers (Tavily → Claude → Perplexity → Firecrawl), scores them across four dimensions (market fit, founder fit, opportunity quality, attractiveness), and surfaces the most relevant, realistic, and profitable opportunities. Includes a bottleneck-driven idea generator.
 
-## Was macht das?
-
-Liest Ideen, Chancen und Wissensbereiche aus einem Obsidian-Vault, lässt das
-LLM die mühsame Arbeit machen (Chancen aus Ideen ableiten, Verknüpfungen
-generieren, fehlende Felder ausfüllen), recherchiert Marktdaten extern,
-scort die Ideen, schreibt alles zurück in den Vault.
-
-Ziel: aus ~100 Geschäftsideen 5 Fokushypothesen herauskondensieren.
-
-## Architektur
+## System Overview
 
 ```
-Du ──spricht──> Claude/Claude Code ──ruft──> CLI/Tools ──liest/schreibt──> Vault
-                                                  │
-                                                  ├──> Research-Cache (SQLite)
-                                                  └──> Web/APIs (Statista, Destatis, ...)
+Ideas (ingest)
+    → T1 Tavily: snippet scoring, all ideas, cheap pre-sort
+    → T2 Claude+Web: narrative + market data, top 100
+    → T3 Perplexity: deep research, top 50
+    → T4 Firecrawl: full-page scrape analysis, top 25
+    → select-hypotheses: 5–10 diverse picks → HYPOTHESES.md
+    → full-report: all findings → FULL_REPORT.md
+
+Generator (bottleneck analysis → new ideas → cascade through tiers)
+    Path A: --domain "myzel leather"   (user-specified domain)
+    Path B: --from-vault               (auto: high-market low-fit ideas)
 ```
+
+## Scoring Model (v2.1)
+
+`score = 0.35 × market + 0.28 × fit + 0.20 × chance + 0.17 × attractiveness`
+
+| Dimension | Weight | What it measures |
+|-----------|--------|-----------------|
+| Market | 35% | Willingness to pay, market size, potential, awareness |
+| Fit | 28% | Difficulty, time-to-revenue, personal knowledge leverage |
+| Chance | 20% | Linked problem field quality (urgency, prevalence, impact) |
+| Attractiveness | 17% | Impact, innovativeness, mission fit |
+
+Scale: 1 = best, 6 = worst (inverted log scale internally).
+
+## Research Tiers
+
+| Tier | Tool | Ideas | Cost/idea | Output |
+|------|------|-------|-----------|--------|
+| T1 | Tavily | All | ~$0.01 | 4 market scores from snippets |
+| T2 | Claude + Web Search | Top 100 | ~$0.20 | Scores + narrative (market data, CAGR, competitors) |
+| T3 | Perplexity sonar-pro | Top 50 | ~$0.75 | Scores + deep narrative |
+| T4 | Firecrawl | Top 25 | ~2 credits | Scores + narrative from full web pages |
+| T5 | Autonomous loop | Top 5 | ~$3.00 | Qualitative research notes |
+
+Limits scale automatically with vault size (see `config/tiers.yaml`).
 
 ## Setup
 
 ```bash
-cd ~/idea-pipeline
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-ideapipe hello
+git clone <repo> && cd idea-pipeline
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
 
-# Vault path (default: ~/vaults/idea-validation)
+# Create .env with API keys
+ANTHROPIC_API_KEY=sk-ant-...
+TAVILY_API_KEY=tvly-...
+FIRECRAWL_API_KEY=fc-...
+PERPLEXITY_API_KEY=pplx-...  # optional, needed for T3
+
 export IDEAPIPE_VAULT=~/vaults/idea-validation
 ```
 
-## Pipeline-Steps
-
-| # | Step | Status | Liefert |
-|---|------|--------|---------|
-| 1 | Skeleton + Env | ✓ | Pipeline läuft |
-| 2 | Schemas (db-based detection) | ✓ | Type-safe Daten, `schema check` |
-| 3 | Vault-IO (read/write/list/doctor) | ✓ | atomare Vault-Operationen |
-| 4 | Validation-Vault aufsetzen | TODO | echte Notizen importiert |
-| 5 | Idea-Intake CLI (`ingest`) | ✓ | aus Liste → Idee-Stubs |
-| 6 | LLM-Enrichment: Chancen-Generierung | TODO | LLM erzeugt Chance-Stubs |
-| 7 | LLM-Linking: Idee↔Chance↔Wissen | TODO | LLM verknüpft Notizen |
-| 8 | T0 Scoring (vault-only) | TODO | erstes Leaderboard |
-| 9 | Research-Layer (Cache + Web) | TODO | externe Daten in Felder |
-| 10 | Tier-Funnel + Review-CLI | TODO | T0→T3 mit Cuts |
-| 11 | Mehr Quellen + LLM-Derivat-Felder | TODO | bessere Score-Quality |
-| 12 | Idea-Generator + NL-Interface | TODO | Variationen, NL-Steuerung |
-
-## CLI-Commands
+## Full Pipeline Run
 
 ```bash
-# Basics
-ideapipe hello
-ideapipe info
+# 1. Add ideas
+ideapipe ingest "My Idea: one-line description"
+ideapipe ingest --file ideas.txt          # batch
 
-# Schema validation
-ideapipe schema check FILE [-v]
-ideapipe schema check-dir DIR [--show-unknown]
+# 2. Enrich and link
+ideapipe enrich                           # generate problem fields
+ideapipe link                             # match to knowledge areas
+ideapipe enrich-intrinsic                 # LLM: attractiveness, fit, gates
 
-# Vault operations (Step 3)
-ideapipe vault read FILE [-v]
-ideapipe vault list [--vault PATH] [--type idee|chance|wissen] [-v]
-ideapipe vault doctor [--vault PATH]
-ideapipe vault write-test FILE
+# 3. Score and research
+ideapipe score
+ideapipe research --tier 1               # all ideas
+ideapipe research --tier 2               # top 100 (auto-pushes leaderboard)
+ideapipe research --tier 3               # top 50
+ideapipe research --tier 4               # top 25
+
+# 4. Synthesize
+ideapipe select-hypotheses               # pick 5–10 diverse T4 ideas
+ideapipe full-report                     # detailed report with all findings
 ```
 
-## Conventions
+## Idea Generation
 
-- Note type is detected from `database` field (not filename)
-- `id` = filename without `.md` extension (never stored in YAML)
-- Score values: integers 1-6 (1 = best, 6 = worst)
-- Wikilinks are parsed on read, reconstructed on write
-- Writes are atomic (temp + rename) — no half-written files
-- Vault typos (`credebility`, `umprella_problem`) are tolerated via aliases
+```bash
+# Path A: analyze a domain, find bottleneck, generate ideas
+ideapipe generate --domain "myzel leather"
+
+# Path B: auto-select hard-to-execute high-potential vault ideas
+ideapipe generate --from-vault
+
+# Both paths cascade new ideas through tiers automatically
+# New idea → T1 → if top 100 → T2 → if top 50 → T3 → if top 25 → T4
+```
+
+## Leaderboards
+
+| File | Contents |
+|------|----------|
+| `LEADERBOARD.md` | All 199+ ideas ranked by v2.1 score |
+| `LEADERBOARD_T3.md` | Only T3+ researched ideas |
+| `LEADERBOARD_T4.md` | Only T4+ researched ideas |
+| `HYPOTHESES.md` | 5–10 diverse working hypotheses with next steps |
+| `FULL_REPORT.md` | Per-idea detailed report with all research findings |
+
+## Utilities
+
+```bash
+ideapipe vault doctor          # data quality check (broken links, unscored)
+ideapipe cache-stats           # API cache size and entry count
+ideapipe compare-versions      # v1 vs v2.1 score comparison
+ideapipe info                  # vault path, idea count, system info
+```
+
+## Vault Structure
+
+Markdown + YAML frontmatter files (Obsidian-compatible):
+
+```
+vault/
+  Ideen/      — IdeeNote: business ideas with scores and research
+  Chancen/    — ChanceNote: problem/opportunity fields
+  Wissen/     — WissenNote: personal knowledge areas
+```
+
+## Extension & Agent Handoff
+
+See `CLAUDE.md` for the full extension guide, invariants, and current system state. All plans in `docs/superpowers/plans/`.
