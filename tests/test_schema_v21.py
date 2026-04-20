@@ -98,3 +98,23 @@ def test_fit_time_to_revenue_bounds():
         "fit_time_to_first_revenue_months": 12,
     })
     assert note.fit_time_to_first_revenue_months == 12
+
+
+def test_ideenote_generation_fields_default_none():
+    note = IdeeNote.model_validate({
+        "id": "test",
+        "database": ["geschaeftsideen"],
+    })
+    assert note.generated_from is None
+    assert note.generation_bottleneck is None
+
+
+def test_ideenote_generation_fields_roundtrip():
+    note = IdeeNote.model_validate({
+        "id": "test",
+        "database": ["geschaeftsideen"],
+        "generated_from": "domain:myzel leder",
+        "generation_bottleneck": "Substratproduktion nicht skalierbar",
+    })
+    assert note.generated_from == "domain:myzel leder"
+    assert note.generation_bottleneck == "Substratproduktion nicht skalierbar"

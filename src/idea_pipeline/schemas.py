@@ -198,6 +198,10 @@ class IdeeNote(BaseNote):
     # T5 signal
     t5_risk_flag: bool = False
 
+    # Generation provenance (set by ideapipe generate)
+    generated_from: Optional[str] = None           # "domain:myzel leder" or "idea:<source_id>"
+    generation_bottleneck: Optional[str] = None    # one-line bottleneck that spawned this idea
+
     # Score metadata
     score_v1: Optional[float] = None
     score_history: List[ScoreHistoryEntry] = Field(default_factory=list)
