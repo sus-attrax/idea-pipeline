@@ -174,7 +174,6 @@ def _research_domain_t1(domain: str) -> str:
 def _research_domain_t2(domain: str, t1_context: str) -> str:
     """T2: Claude WebSearch — deeper narrative on failure modes and blockers."""
     from anthropic import Anthropic
-    from idea_pipeline.research.sources.base import parse_json
 
     llm = Anthropic()
     prompt = _load_prompt("domain_research_t2.txt")
