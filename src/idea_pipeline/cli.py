@@ -24,6 +24,7 @@ from rich.table import Table
 
 from idea_pipeline.enrich import EnrichResult, run_enrich
 from idea_pipeline.enrich_intrinsic import EnrichIntrinsicResult, run_intrinsic_enrich
+from idea_pipeline.generator import GenerateResult, _select_path_b_candidates, run_generate_domain
 from idea_pipeline.link import LinkResult, run_link
 from idea_pipeline.scoring import ScoreResult, score_vault
 from idea_pipeline.research.cache import cache_stats
@@ -1257,6 +1258,93 @@ def enrich_intrinsic_cmd(
     if result.errors:
         for idea_id, msg in result.errors:
             console.print(f"  [red]✗[/red] {idea_id}: {msg}")
+
+
+@app.command("generate")
+def generate_cmd(
+    vault: Optional[Path] = _vault_option,
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Domain to analyze, e.g. 'myzel leder'"),
+    from_vault: bool = typer.Option(False, "--from-vault", help="Auto-select high-market/low-fit vault ideas"),
+    limit: int = typer.Option(5, "--limit", "-n", help="Max vault ideas to process (Path B only)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Research + analyze but don't write to vault"),
+    select: Optional[str] = typer.Option(None, "--select", help="Non-interactive selection, e.g. '1,3'"),
+) -> None:
+    """Generate focused business ideas by analyzing domain bottlenecks.
+
+    Path A (--domain): research a free-text domain and generate ideas addressing its bottleneck.
+    Path B (--from-vault): auto-select vault ideas with high market + low fit, then generate focused variants.
+    """
+    if not domain and not from_vault:
+        console.print("[red]✗[/red] Provide --domain or --from-vault")
+        raise typer.Exit(1)
+    if domain and from_vault:
+        console.print("[red]✗[/red] Use --domain OR --from-vault, not both")
+        raise typer.Exit(1)
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    select_indices: Optional[list[int]] = None
+    if select:
+        try:
+            select_indices = [int(x.strip()) for x in select.split(",")]
+        except ValueError:
+            console.print("[red]✗[/red] --select must be comma-separated integers, e.g. '1,3'")
+            raise typer.Exit(1)
+
+    domains: list[str] = []
+    if domain:
+        domains = [domain]
+    else:
+        from idea_pipeline.schemas import IdeeNote
+        all_ideen = list_notes(vault_path, IdeeNote).notes
+        path_b = _select_path_b_candidates(all_ideen, limit=limit)
+        if not path_b:
+            console.print("[yellow]No Path B candidates found (need scored ideas with market+fit breakdown)[/yellow]")
+            raise typer.Exit(0)
+        domains = [desc for _, desc in path_b if desc]
+        console.print(f"[bold]Path B:[/bold] {len(domains)} vault candidates selected")
+        for idea_id, desc in path_b:
+            console.print(f"  [cyan]{idea_id}[/cyan]: {desc[:80]}")
+
+    dry_label = " [dim](dry-run)[/dim]" if dry_run else ""
+    console.print(f"\n[bold]ideapipe generate[/bold]{dry_label}  {len(domains)} domain(s)\n")
+
+    all_written: list[str] = []
+    for d in domains:
+        console.print(f"[bold]▶ Domain:[/bold] {d}")
+        result = run_generate_domain(
+            domain=d,
+            vault_path=vault_path,
+            dry_run=dry_run,
+            select=select_indices,
+        )
+
+        if result.error:
+            console.print(f"  [red]✗ Error:[/red] {result.error}")
+            continue
+
+        if result.bottleneck:
+            console.print(f"  [yellow]Bottleneck ({result.bottleneck.type}, {result.bottleneck.severity}):[/yellow] {result.bottleneck.bottleneck}")
+            console.print(f"  {result.bottleneck.blocking_factor[:200]}")
+
+        if not result.candidates:
+            console.print("  [dim]No candidates generated[/dim]")
+            continue
+
+        console.print(f"\n  [bold]{len(result.candidates)} candidates:[/bold]")
+        for i, c in enumerate(result.candidates, 1):
+            status = "[green]✓ written[/green]" if c.id in result.written else "[dim]skipped[/dim]"
+            if dry_run:
+                status = "[dim]dry-run[/dim]"
+            console.print(f"  [{i}] {status}  {c.description[:120]}")
+
+        all_written.extend(result.written)
+
+    if not dry_run and all_written:
+        console.print(f"\n[green]✓[/green] {len(all_written)} new idea(s) written to vault. Run [bold]ideapipe score --version v2.1[/bold] to score them.")
 
 
 if __name__ == "__main__":
