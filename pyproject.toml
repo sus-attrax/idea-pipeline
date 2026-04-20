@@ -13,7 +13,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # Research
     "tavily-python>=0.3.0",
-    "firecrawl-py>=1.0.0",\n    "openai>=1.0.0",
+    "firecrawl-py>=1.0.0",
+    "openai>=1.0.0",
     # Vault I/O
     "python-frontmatter>=1.1.0",
     # Data validation & modeling

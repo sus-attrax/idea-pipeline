@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "type": "stdio",
+      "command": "/home/homo/.local/bin/mcp-sequential-thinking"
+    },
+    "context7": {
+      "type": "stdio",
+      "command": "/home/homo/.local/bin/mcp-context7"
+    }
+  }
+}
