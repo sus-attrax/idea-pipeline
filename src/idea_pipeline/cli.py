@@ -1853,5 +1853,75 @@ def select_hypotheses(
         console.print(f"  {i}. [cyan]{idea.id}[/cyan]  [{domain}]  score={idea.score:.4f}")
 
 
+@app.command("full-report")
+def full_report_cmd(
+    vault: Optional[Path] = _vault_option,
+    min_tier: int = typer.Option(4, "--min-tier"),
+    limit: int = typer.Option(25, "--limit"),
+    out: Path = typer.Option(Path("FULL_REPORT.md"), "--out", "-o"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview first 3 ideas, no file written"),
+) -> None:
+    """Generate a detailed per-idea report for top T4+ ideas.
+
+    Includes score breakdown, all research narratives (T2/T3/T4),
+    linked problem fields, knowledge areas, and idea notes.
+    """
+    from idea_pipeline.research.sources.base import tier_level
+    from idea_pipeline.report import build_full_report
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    # Load and filter ideas
+    all_notes = list_notes(vault_path, IdeeNote).notes
+    eligible: list[IdeeNote] = [
+        vn.model for vn in all_notes
+        if vn.model.score is not None and tier_level(vn.model.research_fidelity) >= min_tier
+    ]
+    eligible.sort(key=lambda m: m.score or 0, reverse=True)
+    ideas = eligible[:limit]
+
+    total_eligible = len(eligible)
+
+    if dry_run:
+        console.print(
+            f"[bold yellow]Dry run[/bold yellow] — "
+            f"{total_eligible} ideas at tier{min_tier}+, would include {len(ideas)} (limit={limit}).\n"
+            f"Preview of first 3:\n"
+        )
+        for rank, idea in enumerate(ideas[:3], 1):
+            sb = idea.score_breakdown or {}
+            console.print(
+                f"  [bold]#{rank}[/bold] [cyan]{idea.id}[/cyan]  "
+                f"score={idea.score:.3f}  tier={idea.research_fidelity}  "
+                f"capital={idea.capital_class or '—'}  "
+                f"wtp={idea.willingness_to_pay}/6"
+            )
+            console.print(
+                f"       market={sb.get('market_score', 0):.2f}  "
+                f"fit={sb.get('fit_score', 0):.2f}  "
+                f"chance={sb.get('chance_score', 0):.2f}  "
+                f"attr={sb.get('attractiveness_score', 0):.2f}"
+            )
+        return
+
+    if not ideas:
+        console.print(f"[yellow]No ideas found at tier{min_tier}+ with a score.[/yellow]")
+        raise typer.Exit(0)
+
+    console.print(f"Building full report for [bold]{len(ideas)}[/bold] ideas (tier{min_tier}+) ...")
+
+    report_text = build_full_report(ideas, vault_path)
+
+    if not out.is_absolute():
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        out = repo_root / out
+
+    out.write_text(report_text, encoding="utf-8")
+    console.print(f"[green]✓[/green] {out}  ({len(ideas)} ideas)")
+
+
 if __name__ == "__main__":
     app()
