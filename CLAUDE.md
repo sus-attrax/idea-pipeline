@@ -83,4 +83,10 @@ Scale: 1 = best, 6 = worst. Internal: inverted log scale.
 
 ## Where We Left Off
 *(Agent: update this line at session end)*
-Finalization plan executed: Tasks 1–7 complete. Task 8 (README) remaining.
+Finalization plan fully executed (2026-04-20). All 9 tasks complete.
+Recommended next steps:
+- Run ideapipe select-hypotheses and commit HYPOTHESES.md
+- Run ideapipe full-report and commit FULL_REPORT.md
+- Replenish Firecrawl credits, run T4 on remaining top-25 ideas
+- Replenish Perplexity credits, run T3 on remaining top-50 ideas
+- For top 3 hypotheses: run T5 autoresearch
