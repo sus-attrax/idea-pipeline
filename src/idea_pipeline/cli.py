@@ -735,7 +735,7 @@ def _run_cascade(new_idea_ids: list[str], vault_path: Path) -> None:
     console.print(f"  [bold]T1[/bold] — researching {len(new_idea_ids)} idea(s)…")
     ids_arg = ",".join(new_idea_ids)
     result = subprocess.run(
-        [sys.executable, "-m", "idea_pipeline.cli", "research", "--tier", "1", "--include", ids_arg],
+        [sys.executable, "-m", "idea_pipeline.cli", "research", "--vault", str(vault_path), "--tier", "1", "--include", ids_arg],
         capture_output=False,
     )
     if result.returncode != 0:
@@ -779,7 +779,7 @@ def _run_cascade(new_idea_ids: list[str], vault_path: Path) -> None:
         ids_arg = ",".join(advanced)
         console.print(f"  [bold]T{tier}[/bold] — researching {len(advanced)} idea(s)…")
         result = subprocess.run(
-            [sys.executable, "-m", "idea_pipeline.cli", "research", "--tier", str(tier), "--include", ids_arg],
+            [sys.executable, "-m", "idea_pipeline.cli", "research", "--vault", str(vault_path), "--tier", str(tier), "--include", ids_arg],
             capture_output=False,
         )
         if result.returncode != 0:
@@ -1525,7 +1525,7 @@ def generate_cmd(
         all_written.extend(result.written)
 
     if dry_run and cascade:
-        console.print(f"\n[dim]Would cascade {len(domains)} new idea(s) through tiers T1→T4 (--cascade)[/dim]")
+        console.print(f"\n[dim]Would cascade new idea(s) from {len(domains)} domain(s) through tiers T1→T4 (--cascade)[/dim]")
 
     if not dry_run and all_written:
         console.print(f"\n[green]✓[/green] {len(all_written)} new idea(s) written to vault.")
