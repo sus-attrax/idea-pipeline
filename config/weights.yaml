@@ -1,37 +1,79 @@
-# Scoring weights — additive, gewichtet.
-# Alle Werte invertiert (7 - x), so dass größer = besser.
-# TODO Step 5: justieren wenn erste Leaderboards seltsam aussehen.
+# Scoring weights — two versions coexist.
+# v1: legacy additive (backward compat, preserved in scoring_v1.py)
+# v2_1: new 4-dimension model (active, in scoring.py)
 
-version: v1
+active_version: v2_1
 
-# Top-level Gewichte: wie stark fließen Chancen, Wissen und intrinsische
-# Idee-Eigenschaften ins finale Idee-Scoring ein? Summe sollte 1.0 sein.
-top_level:
-  chance_contribution: 0.40
-  wissen_contribution: 0.25
-  intrinsic_contribution: 0.35
+v1:
+  top_level:
+    chance_contribution: 0.40
+    wissen_contribution: 0.25
+    intrinsic_contribution: 0.35
+  chance:
+    granularitaet: 0.10
+    urgency: 0.20
+    prevalence: 0.20
+    impact: 0.25
+    personal_experience: 0.15
+    market_awareness: 0.10
+  wissen:
+    enjoyment: 0.30
+    confidence: 0.25
+    credebility: 0.25
+    contacts: 0.20
+  idee_intrinsic:
+    market_size: 0.20
+    market_potential: 0.20
+    impact: 0.20
+    difficulty: 0.15
+    time_investment: 0.10
+    innovativeness: 0.15
 
-# Gewichte innerhalb der Chance-Felder
-chance:
-  granularitaet: 0.10
-  urgency: 0.20
-  prevalence: 0.20
-  impact: 0.25
-  personal_experience: 0.15
-  market_awareness: 0.10
+v2_1:
+  top_level:
+    market: 0.35
+    fit: 0.28
+    chance: 0.20
+    attractiveness: 0.17
 
-# Gewichte innerhalb der Wissen-Felder
-wissen:
-  enjoyment: 0.30
-  confidence: 0.25
-  credebility: 0.25
-  contacts: 0.20
+  attractiveness:
+    impact: 0.40
+    innovativeness: 0.30
+    mission_fit: 0.30
 
-# Gewichte für die intrinsischen Idee-Felder
-idee_intrinsic:
-  market_size: 0.20
-  market_potential: 0.20
-  impact: 0.20
-  difficulty: 0.15
-  time_investment: 0.10
-  innovativeness: 0.15
+  fit:
+    difficulty: 0.25
+    time_to_revenue: 0.25
+    knowledge: 0.50
+
+  fit_knowledge:
+    mastery: 0.35
+    obsession: 0.35
+
+  market:
+    market_size: 0.30
+    market_potential: 0.30
+    willingness_to_pay: 0.25
+    market_awareness: 0.15
+
+  chance:
+    granularitaet: 0.15
+    urgency: 0.20
+    prevalence: 0.20
+    impact: 0.20
+    personal_experience: 0.10
+    market_awareness: 0.15
+
+knowledge_signals:
+  mastery_weights:
+    confidence: 0.50
+    credibility: 0.30
+    contacts: 0.20
+  obsession_weights:
+    enjoyment: 1.0
+  cross_domain:
+    high_threshold: 0.65
+    bonus: 1.0
+  no_links_floor:
+    mastery_leverage: 0.4
+    obsession_leverage: 0.4

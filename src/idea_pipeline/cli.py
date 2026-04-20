@@ -23,6 +23,8 @@ from rich.console import Console
 from rich.table import Table
 
 from idea_pipeline.enrich import EnrichResult, run_enrich
+from idea_pipeline.enrich_intrinsic import EnrichIntrinsicResult, run_intrinsic_enrich
+from idea_pipeline.generator import GenerateResult, _select_path_b_candidates, run_generate_domain
 from idea_pipeline.link import LinkResult, run_link
 from idea_pipeline.scoring import ScoreResult, score_vault
 from idea_pipeline.research.cache import cache_stats
@@ -647,46 +649,63 @@ def link_cmd(
 @app.command("score")
 def score_cmd(
     vault: Optional[Path] = _vault_option,
-    tier: int = typer.Option(0, "--tier", "-t", help="Research tier (0=vault only)"),
-    top: Optional[int] = typer.Option(None, "--top", "-n", help="Show only top N ideas"),
+    version: str = typer.Option("v2.1", "--version", help="Scoring version: v1 or v2.1"),
+    top_n: Optional[int] = typer.Option(None, "--top", "-n", help="Show only top N ideas"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Compute scores without writing to vault"),
+    trigger: str = typer.Option("manual", "--trigger", help="Label for score_history entry"),
+    save_as_v1: bool = typer.Option(False, "--save-as-score-v1", help="Also freeze score into score_v1 field"),
 ) -> None:
-    """Score all ideas and print a leaderboard (T0: vault-only, no research).
+    """Score all ideas. Default version: v2.1. Use --version v1 for legacy scoring."""
+    import datetime
 
-    Writes score, score_breakdown, score_version, scored_at into each idea note.
-    Idempotent — safe to re-run after adding new chances or wissen links.
-    """
     vault_path = get_vault_path(vault)
     if not vault_path.is_dir():
         console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
         raise typer.Exit(1)
 
-    if tier != 0:
-        console.print(f"[red]✗ Only --tier 0 is implemented (got {tier})[/red]")
+    if version == "v1":
+        from idea_pipeline.scoring_v1 import score_vault as score_vault_v1
+        console.print("[dim]Running v1 scoring...[/dim]")
+        result = score_vault_v1(vault_path, dry_run=dry_run, top_n=top_n)
+
+        if save_as_v1 and not dry_run:
+            from idea_pipeline.schemas import IdeeNote, ScoreHistoryEntry
+            from idea_pipeline.vault_io import list_notes, write_note as _write_note
+            rank_map = {iid: i + 1 for i, (iid, _) in enumerate(result.scored)}
+            for vnote in list_notes(vault_path, IdeeNote).notes:
+                idea = vnote.model
+                if idea.score is None:
+                    continue
+                idea.score_v1 = idea.score
+                existing_v1 = [e for e in idea.score_history if e.version == "v1"]
+                if not existing_v1:
+                    entry = ScoreHistoryEntry(
+                        date=datetime.date.today().isoformat(),
+                        version="v1",
+                        score=idea.score,
+                        rank=rank_map.get(idea.id),
+                        trigger=trigger,
+                    )
+                    idea.score_history.append(entry)
+                    _write_note(vnote)
+            console.print(f"[green]✓[/green] score_v1 frozen for {len(result.scored)} ideas")
+
+    elif version == "v2.1":
+        from idea_pipeline.scoring import score_vault as score_vault_v21
+        console.print("[dim]Running v2.1 scoring...[/dim]")
+        result = score_vault_v21(vault_path, dry_run=dry_run, top_n=top_n, trigger=trigger)
+    else:
+        console.print(f"[red]Unknown version: {version}. Use v1 or v2.1[/red]")
         raise typer.Exit(1)
 
-    if dry_run:
-        console.print("[bold yellow]Dry run[/bold yellow] — scores computed but not written.\n")
-
-    console.print(f"Scoring [cyan]{vault_path}[/cyan] (T0) ...\n")
-
-    try:
-        result = score_vault(vault_path, dry_run=dry_run, top_n=top)
-    except Exception as e:
-        console.print(f"[red]✗ Scoring failed:[/red] {e}")
-        raise typer.Exit(1)
-
-    from rich.table import Table
-    table = Table(title=f"Leaderboard — T0{'  (dry run)' if dry_run else ''}", show_lines=False)
-    table.add_column("#", style="dim", width=4)
-    table.add_column("Idea", style="cyan", no_wrap=False, max_width=55)
-    table.add_column("Score", justify="right", style="bold green")
-
+    table = Table(title=f"Leaderboard ({version}{'  dry-run' if dry_run else ''})")
+    table.add_column("#", style="dim")
+    table.add_column("Idea")
+    table.add_column("Score", justify="right")
     for rank, (idea_id, score) in enumerate(result.scored, 1):
         table.add_row(str(rank), idea_id, f"{score:.3f}")
-
     console.print(table)
-    console.print(f"\n[dim]{len(result.scored)} ideas scored[/dim]")
+    console.print(f"\n[bold]{len(result.scored)} ideas scored[/bold]")
 
 
 @app.command("research")
@@ -906,11 +925,9 @@ def research_cmd(
 def report_cmd(
     vault: Optional[Path] = _vault_option,
     out: Path = typer.Option(Path("LEADERBOARD.md"), "--out", "-o", help="Output markdown file"),
+    version: str = typer.Option("v2.1", "--version", help="v1 or v2.1 column layout"),
 ) -> None:
-    """Write LEADERBOARD.md — a ranked markdown table of all scored ideas.
-
-    Commit after each research tier to track score progression via git diff.
-    """
+    """Write a ranked markdown leaderboard of all scored ideas."""
     import datetime
     import yaml
 
@@ -919,7 +936,6 @@ def report_cmd(
         console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
         raise typer.Exit(1)
 
-    # Load all idea notes with metadata directly (avoid double-parsing via score_vault)
     ideas: list[dict] = []
     for f in vault_path.glob("*.md"):
         text = f.read_text(encoding="utf-8")
@@ -946,64 +962,389 @@ def report_cmd(
     def fmt(v, fallback="—"):
         return str(v) if v is not None else fallback
 
-    def tier_badge(t):
-        return {"tier1": "T1", "tier2": "T2", "tier3": "T3",
-                "tier4": "T4", "tier5": "T5"}.get(t or "", "—")
-
-    def wissen_str(meta):
-        links = meta.get("wissen") or []
-        if isinstance(links, str):
-            links = [links]
-        names = [str(w).strip("[]").replace("[[", "").replace("]]", "") for w in links]
-        return ", ".join(names) if names else "—"
+    def mastery_bar(v):
+        if v is None:
+            return "·"
+        v = float(v)
+        if v >= 0.75:
+            return "▇"
+        if v >= 0.50:
+            return "▅"
+        if v >= 0.25:
+            return "▃"
+        return "▁"
 
     today = datetime.date.today().isoformat()
-    lines = [
-        f"# Idea Leaderboard — {today}",
-        "",
-        f"**{len(ideas)} ideas scored** · generated by `ideapipe report`",
-        "",
-        "| # | Idea | Score | Tier | mSz | mPot | prev | mAw | ch↑ | ws↑ | intr↑ | Wissen |",
-        "|---|------|------:|:----:|:---:|:----:|:----:|:---:|:---:|:---:|:-----:|--------|",
-    ]
 
-    for rank, m in enumerate(ideas, 1):
-        sb = m.get("score_breakdown") or {}
-        lines.append(
-            f"| {rank} "
-            f"| {m['id']} "
-            f"| {m.get('score', 0):.3f} "
-            f"| {tier_badge(m.get('research_fidelity'))} "
-            f"| {fmt(m.get('market_size'))} "
-            f"| {fmt(m.get('market_potential'))} "
-            f"| {fmt(m.get('prevalence'))} "
-            f"| {fmt(m.get('market_awareness'))} "
-            f"| {sb.get('chance_score', 0):.1f} "
-            f"| {sb.get('wissen_score', 0):.1f} "
-            f"| {sb.get('intrinsic_score', 0):.1f} "
-            f"| {wissen_str(m)} |"
-        )
+    if version == "v2.1":
+        lines = [
+            f"# Idea Leaderboard v2.1 — {today}",
+            "",
+            f"**{len(ideas)} ideas scored** · generated by `ideapipe report --version v2.1`",
+            "",
+            "| # | Idea | Score | Cap | Reg | Kill | Mast | Obs | CD | WTP | mkt↑ | fit↑ | ch↑ | att↑ |",
+            "|---|------|------:|:---:|:---:|:----:|:----:|:---:|:--:|:---:|:----:|:----:|:---:|:----:|",
+        ]
+        for rank, m in enumerate(ideas, 1):
+            sb = m.get("score_breakdown") or {}
+            cd = "✓" if sb.get("cross_domain_flag") else "·"
+            kill = "💀" if sb.get("killer_flag") else "·"
+            lines.append(
+                f"| {rank} "
+                f"| {m['id']} "
+                f"| {m.get('score', 0):.3f} "
+                f"| {fmt(sb.get('capital_class'), '—')[:4]} "
+                f"| {fmt(sb.get('regulation_class'), '—')[:4]} "
+                f"| {kill} "
+                f"| {mastery_bar(sb.get('mastery_leverage'))} "
+                f"| {mastery_bar(sb.get('obsession_leverage'))} "
+                f"| {cd} "
+                f"| {fmt(sb.get('willingness_to_pay'))} "
+                f"| {sb.get('market_score', 0):.1f} "
+                f"| {sb.get('fit_score', 0):.1f} "
+                f"| {sb.get('chance_score', 0):.1f} "
+                f"| {sb.get('attractiveness_score', 0):.1f} |"
+            )
+        lines += [
+            "",
+            "---",
+            "",
+            "**Column guide**",
+            "- **Cap**: capital_class (boot=bootstrappable, seed=seed, vc=vc_dependent)",
+            "- **Reg**: regulation_class (un=unregulated, lo=low, hi=high)",
+            "- **Kill**: 💀 = killer_flag (vc_dependent + high regulation)",
+            "- **Mast/Obs**: mastery/obsession leverage ▁▃▅▇ (0.0→1.0)",
+            "- **CD**: cross_domain_flag ✓ = true",
+            "- **WTP**: willingness_to_pay (1=high, 6=low)",
+            "",
+        ]
+    else:
+        # v1 layout (existing behavior)
+        def tier_badge(t):
+            return {"tier1": "T1", "tier2": "T2", "tier3": "T3", "tier4": "T4", "tier5": "T5"}.get(t or "", "—")
 
-    lines += [
-        "",
-        "---",
-        "",
-        "**Column guide**",
-        "- **Score**: composite pipeline score (higher = better, max 6.0)",
-        "- **Tier**: highest research tier completed (T1=Tavily … T5=AutoResearch)",
-        "- **mSz** market_size · **mPot** market_potential · **prev** prevalence · **mAw** market_awareness — all 1–6 (1=best)",
-        "- **ch↑** chance score · **ws↑** wissen score · **intr↑** intrinsic score — components of composite (higher=better)",
-        "",
-    ]
+        def wissen_str(meta):
+            links = meta.get("wissen") or []
+            if isinstance(links, str):
+                links = [links]
+            names = [str(w).strip("[]").replace("[[", "").replace("]]", "") for w in links]
+            return ", ".join(names) if names else "—"
 
-    # Resolve output path: relative to repo root if not absolute
+        lines = [
+            f"# Idea Leaderboard — {today}",
+            "",
+            f"**{len(ideas)} ideas scored** · generated by `ideapipe report`",
+            "",
+            "| # | Idea | Score | Tier | mSz | mPot | prev | mAw | ch↑ | ws↑ | intr↑ | Wissen |",
+            "|---|------|------:|:----:|:---:|:----:|:----:|:---:|:---:|:---:|:-----:|--------|",
+        ]
+        for rank, m in enumerate(ideas, 1):
+            sb = m.get("score_breakdown") or {}
+            lines.append(
+                f"| {rank} | {m['id']} | {m.get('score', 0):.3f} "
+                f"| {tier_badge(m.get('research_fidelity'))} "
+                f"| {fmt(m.get('market_size'))} | {fmt(m.get('market_potential'))} "
+                f"| {fmt(m.get('prevalence'))} | {fmt(m.get('market_awareness'))} "
+                f"| {sb.get('chance_score', 0):.1f} | {sb.get('wissen_score', 0):.1f} "
+                f"| {sb.get('intrinsic_score', 0):.1f} | {wissen_str(m)} |"
+            )
+
     if not out.is_absolute():
         repo_root = Path(__file__).resolve().parent.parent.parent
         out = repo_root / out
 
     out.write_text("\n".join(lines), encoding="utf-8")
     console.print(f"[green]✓[/green] {out}  ({len(ideas)} ideas)")
-    console.print(f"[dim]Commit with: git add {out.name} && git commit -m 'leaderboard: {today}'[/dim]")
+
+
+@app.command("compare-versions")
+def compare_versions_cmd(
+    vault: Optional[Path] = _vault_option,
+) -> None:
+    """Compare v1 vs v2.1 scores — show rank movements."""
+    import datetime
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    from idea_pipeline.vault_io import list_notes
+    from idea_pipeline.schemas import IdeeNote
+
+    ideas = list_notes(vault_path, IdeeNote).notes
+    rows = []
+    for vnote in ideas:
+        idea = vnote.model
+        if idea.score is None or idea.score_v1 is None:
+            continue
+        rows.append({
+            "id": idea.id,
+            "score_v1": idea.score_v1,
+            "score_v21": idea.score,
+        })
+
+    v1_sorted = sorted(rows, key=lambda x: x["score_v1"], reverse=True)
+    v21_sorted = sorted(rows, key=lambda x: x["score_v21"], reverse=True)
+    v1_rank = {r["id"]: i + 1 for i, r in enumerate(v1_sorted)}
+    v21_rank = {r["id"]: i + 1 for i, r in enumerate(v21_sorted)}
+
+    for r in rows:
+        r["v1_rank"] = v1_rank[r["id"]]
+        r["v21_rank"] = v21_rank[r["id"]]
+        r["delta"] = r["v1_rank"] - r["v21_rank"]
+
+    rows.sort(key=lambda x: abs(x["delta"]), reverse=True)
+
+    today = datetime.date.today().isoformat()
+    lines = [
+        f"# v1 vs v2.1 Score Comparison — {today}",
+        "",
+        f"**{len(rows)} ideas compared**",
+        "",
+        "| Idea | v1 Score | v1 Rank | v2.1 Score | v2.1 Rank | Δ Rank |",
+        "|------|:--------:|:-------:|:----------:|:---------:|:------:|",
+    ]
+    for r in rows:
+        delta_str = f"+{r['delta']}" if r["delta"] > 0 else str(r["delta"])
+        lines.append(
+            f"| {r['id']} "
+            f"| {r['score_v1']:.3f} "
+            f"| #{r['v1_rank']} "
+            f"| {r['score_v21']:.3f} "
+            f"| #{r['v21_rank']} "
+            f"| {delta_str} |"
+        )
+
+    lines += ["", "---", ""]
+    lines += ["## Top 10 Aufsteiger (v1→v2.1)"]
+    risers = sorted(rows, key=lambda x: x["delta"], reverse=True)[:10]
+    for r in risers:
+        lines.append(f"- **{r['id']}**: #{r['v1_rank']} → #{r['v21_rank']} (+{r['delta']})")
+
+    lines += ["", "## Top 10 Absteiger (v1→v2.1)"]
+    fallers = sorted(rows, key=lambda x: x["delta"])[:10]
+    for r in fallers:
+        lines.append(f"- **{r['id']}**: #{r['v1_rank']} → #{r['v21_rank']} ({r['delta']})")
+
+    reports_dir = Path(__file__).resolve().parent.parent.parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    out = reports_dir / f"v1_vs_v2_1_comparison_{today}.md"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    console.print(f"[green]✓[/green] {out}")
+
+
+@app.command("progression")
+def progression_cmd(
+    vault: Optional[Path] = _vault_option,
+    idea_id: Optional[str] = typer.Option(None, "--idea-id", help="Show history for one idea"),
+    all_ideas: bool = typer.Option(False, "--all", help="Show all ideas with score history"),
+    top: int = typer.Option(20, "--top", help="With --all: show top N ideas"),
+) -> None:
+    """Show score progression over time from score_history."""
+    from idea_pipeline.vault_io import list_notes
+    from idea_pipeline.schemas import IdeeNote
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    ideas = list_notes(vault_path, IdeeNote).notes
+
+    if idea_id:
+        match = next((n for n in ideas if n.model.id == idea_id), None)
+        if not match:
+            console.print(f"[red]Idea not found:[/red] {idea_id}")
+            raise typer.Exit(1)
+        history = match.model.score_history
+        if not history:
+            console.print(f"No score history for {idea_id}")
+            raise typer.Exit(0)
+        table = Table(title=f"Score history: {idea_id}")
+        table.add_column("Date")
+        table.add_column("Version")
+        table.add_column("Score", justify="right")
+        table.add_column("Rank", justify="right")
+        table.add_column("Trigger")
+        for entry in history:
+            table.add_row(
+                entry.date,
+                entry.version,
+                f"{entry.score:.3f}",
+                str(entry.rank or "—"),
+                entry.trigger or "—",
+            )
+        console.print(table)
+    elif all_ideas:
+        rows = [n for n in ideas if n.model.score_history]
+        rows.sort(key=lambda n: n.model.score or 0, reverse=True)
+        rows = rows[:top]
+
+        table = Table(title=f"Score progression — top {top}")
+        table.add_column("Idea")
+        all_versions: list[str] = []
+        for n in rows:
+            for e in n.model.score_history:
+                if e.version not in all_versions:
+                    all_versions.append(e.version)
+
+        for v in all_versions:
+            table.add_column(f"Score ({v})", justify="right")
+            table.add_column(f"Rank ({v})", justify="right")
+
+        for n in rows:
+            hist_by_version = {}
+            for e in n.model.score_history:
+                hist_by_version[e.version] = e
+            row_data = [n.model.id]
+            for v in all_versions:
+                e = hist_by_version.get(v)
+                row_data.append(f"{e.score:.3f}" if e else "—")
+                row_data.append(f"#{e.rank}" if e and e.rank else "—")
+            table.add_row(*row_data)
+
+        console.print(table)
+    else:
+        console.print("Specify --idea-id X or --all")
+
+
+@app.command("enrich-intrinsic")
+def enrich_intrinsic_cmd(
+    vault: Optional[Path] = _vault_option,
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without API calls"),
+    force: bool = typer.Option(False, "--force", help="Re-enrich already-enriched ideas"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-n", help="Process only N ideas"),
+) -> None:
+    """Step 10: LLM batch rebuild of attractiveness, fit, and gates for all ideas.
+
+    Idempotent: skips ideas already enriched (attractiveness_impact != 6), unless --force.
+    Costs ~$5 for all 142 ideas (Sonnet 4.6, batch size 5).
+    """
+    import math
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    from idea_pipeline.vault_io import list_notes
+    from idea_pipeline.schemas import IdeeNote
+
+    all_ideen = list_notes(vault_path, IdeeNote).notes
+    to_enrich = [n for n in all_ideen if n.model.attractiveness_impact == 6 or force]
+    effective = min(len(to_enrich), limit or len(to_enrich))
+
+    estimated_cost = (math.ceil(effective / 5)) * 0.15
+    console.print(f"[bold]enrich-intrinsic[/bold]  {effective} ideas · ~${estimated_cost:.2f} estimated")
+
+    if not dry_run and estimated_cost > 1.0:
+        confirm = typer.confirm(f"Run LLM enrichment for {effective} ideas (~${estimated_cost:.2f})?")
+        if not confirm:
+            console.print("Aborted.")
+            raise typer.Exit(0)
+
+    result = run_intrinsic_enrich(
+        vault_path,
+        dry_run=dry_run,
+        force=force,
+        limit=limit,
+    )
+    console.print(
+        f"\n[green]✓[/green] enriched={len(result.enriched)} "
+        f"skipped={len(result.skipped)} "
+        f"errors={len(result.errors)}"
+    )
+    if result.errors:
+        for idea_id, msg in result.errors:
+            console.print(f"  [red]✗[/red] {idea_id}: {msg}")
+
+
+@app.command("generate")
+def generate_cmd(
+    vault: Optional[Path] = _vault_option,
+    domain: Optional[str] = typer.Option(None, "--domain", "-d", help="Domain to analyze, e.g. 'myzel leder'"),
+    from_vault: bool = typer.Option(False, "--from-vault", help="Auto-select high-market/low-fit vault ideas"),
+    limit: int = typer.Option(5, "--limit", "-n", help="Max vault ideas to process (Path B only)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Research + analyze but don't write to vault"),
+    select: Optional[str] = typer.Option(None, "--select", help="Non-interactive selection, e.g. '1,3'"),
+) -> None:
+    """Generate focused business ideas by analyzing domain bottlenecks.
+
+    Path A (--domain): research a free-text domain and generate ideas addressing its bottleneck.
+    Path B (--from-vault): auto-select vault ideas with high market + low fit, then generate focused variants.
+    """
+    if not domain and not from_vault:
+        console.print("[red]✗[/red] Provide --domain or --from-vault")
+        raise typer.Exit(1)
+    if domain and from_vault:
+        console.print("[red]✗[/red] Use --domain OR --from-vault, not both")
+        raise typer.Exit(1)
+
+    vault_path = get_vault_path(vault)
+    if not vault_path.is_dir():
+        console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
+        raise typer.Exit(1)
+
+    select_indices: Optional[list[int]] = None
+    if select:
+        try:
+            select_indices = [int(x.strip()) for x in select.split(",")]
+        except ValueError:
+            console.print("[red]✗[/red] --select must be comma-separated integers, e.g. '1,3'")
+            raise typer.Exit(1)
+
+    domains: list[str] = []
+    if domain:
+        domains = [domain]
+    else:
+        from idea_pipeline.schemas import IdeeNote
+        all_ideen = list_notes(vault_path, IdeeNote).notes
+        path_b = _select_path_b_candidates(all_ideen, limit=limit)
+        if not path_b:
+            console.print("[yellow]No Path B candidates found (need scored ideas with market+fit breakdown)[/yellow]")
+            raise typer.Exit(0)
+        domains = [desc for _, desc in path_b if desc]
+        console.print(f"[bold]Path B:[/bold] {len(domains)} vault candidates selected")
+        for idea_id, desc in path_b:
+            console.print(f"  [cyan]{idea_id}[/cyan]: {desc[:80]}")
+
+    dry_label = " [dim](dry-run)[/dim]" if dry_run else ""
+    console.print(f"\n[bold]ideapipe generate[/bold]{dry_label}  {len(domains)} domain(s)\n")
+
+    all_written: list[str] = []
+    for d in domains:
+        console.print(f"[bold]▶ Domain:[/bold] {d}")
+        result = run_generate_domain(
+            domain=d,
+            vault_path=vault_path,
+            dry_run=dry_run,
+            select=select_indices,
+        )
+
+        if result.error:
+            console.print(f"  [red]✗ Error:[/red] {result.error}")
+            continue
+
+        if result.bottleneck:
+            console.print(f"  [yellow]Bottleneck ({result.bottleneck.type}, {result.bottleneck.severity}):[/yellow] {result.bottleneck.bottleneck}")
+            console.print(f"  {result.bottleneck.blocking_factor[:200]}")
+
+        if not result.candidates:
+            console.print("  [dim]No candidates generated[/dim]")
+            continue
+
+        console.print(f"\n  [bold]{len(result.candidates)} candidates:[/bold]")
+        for i, c in enumerate(result.candidates, 1):
+            status = "[green]✓ written[/green]" if c.id in result.written else "[dim]skipped[/dim]"
+            if dry_run:
+                status = "[dim]dry-run[/dim]"
+            console.print(f"  [{i}] {status}  {c.description[:120]}")
+
+        all_written.extend(result.written)
+
+    if not dry_run and all_written:
+        console.print(f"\n[green]✓[/green] {len(all_written)} new idea(s) written to vault. Run [bold]ideapipe score --version v2.1[/bold] to score them.")
 
 
 if __name__ == "__main__":

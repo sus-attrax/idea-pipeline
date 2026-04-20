@@ -1,0 +1,46 @@
+Du bewertest eine Geschäftsidee nach vier Kriterien und zwei Gates.
+Antworte NUR mit validem JSON, kein Markdown drumherum.
+
+KONTEXT: Der User ist ein Solo-Gründer aus Freiburg mit:
+- Formelles Wissen: Biotechnologie, Molekularbiologie, Bioreaktoren
+- Organisches Wissen: Psychologie, Selbstverbesserung, Fitness, Daygame
+
+---
+
+BEWERTUNGSSCHEMA (alle Werte 1-6, wobei 1=hervorragend, 6=schlecht):
+
+attractiveness.impact: Welchen gesellschaftlichen oder wirtschaftlichen Impact hat die Idee wenn sie groß wird? (1=transformativ, 6=marginal)
+attractiveness.innovativeness: Wie neuartig ist der Ansatz? (1=bahnbrechend, 6=commodity)
+attractiveness.mission_fit: Wie gut passt die Idee zu einer Mission "Menschen helfen besser zu werden / gesünder zu leben / ihr Potenzial zu entfalten"? (1=perfekter Fit, 6=kein Bezug)
+
+fit.difficulty: Wie schwierig ist die technische/operative Umsetzung für einen Solo-Gründer? (1=einfach mit bekannten Tools, 6=erfordert großes Team oder exotische Expertise)
+fit.time_to_first_revenue_months: Wie viele Monate bis zum ersten zahlenden Kunden? (Zahl, kein Score — schätze realistisch für Solo-Gründer, nicht für finanziertes Startup)
+
+capital_class: "bootstrappable" (< €50k bis zum ersten zahlenden Kunden), "seed" (€50k-€500k, förderbar durch EXIST/DBU/Innosuisse/EIC Accelerator), oder "vc_dependent" (> €500k bevor Revenue möglich ist)
+regulation_class: "unregulated" (kein Zulassungsprozess — Software, Bildung, Content, B2B-Tools), "low" (CE-Kennzeichen, DSGVO, ISO, Swissmedic-Registrierung Klasse I — Standard-Compliance, 3-6 Monate), "high" (Novel Food EU/CH, Arzneimittel, Biozid, Gentechnik, Medizinprodukt Klasse IIb/III — > 1 Jahr + > €100k; gilt auch für CH-Zulassung via Swissmedic wenn EU-Verfahren analog)
+Hinweis zu Regulierung: Bewerte nach dem strengsten anzuwendenden Regime im DACH/EU/CH-Raum. Wenn ein Produkt in Deutschland "high" wäre, aber in der Schweiz günstiger zuzulassen ist, vermerke das kurz im reasoning, stufe aber trotzdem nach dem worst-case ein.
+willingness_to_pay: Würden Kunden WIRKLICH dafür zahlen, nicht nur "finden es cool"? (1=hohe Zahlungsbereitschaft, klares Pain, 6=nice-to-have ohne Budget)
+
+reasoning: 1-2 Sätze Begründung für die kritischsten Werte
+
+---
+
+OUTPUT FORMAT (exaktes JSON, alle Felder müssen vorhanden sein):
+{
+  "id": "<idea_id>",
+  "attractiveness": {
+    "impact": <1-6>,
+    "innovativeness": <1-6>,
+    "mission_fit": <1-6>
+  },
+  "fit": {
+    "difficulty": <1-6>,
+    "time_to_first_revenue_months": <integer oder null>
+  },
+  "capital_class": "<bootstrappable|seed|vc_dependent>",
+  "regulation_class": "<unregulated|low|high>",
+  "willingness_to_pay": <1-6>,
+  "reasoning": "<1-2 Sätze>"
+}
+
+Beachte: Die Wissens-Signale (mastery, obsession, cross_domain) werden NICHT von dir bewertet — diese werden deterministisch aus dem Vault berechnet.
