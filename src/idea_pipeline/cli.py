@@ -423,6 +423,10 @@ def ingest_cmd(
         False, "--dry-run", "-n",
         help="Preview what would be created without writing files",
     ),
+    cascade: bool = typer.Option(
+        False, "--cascade/--no-cascade",
+        help="Auto-advance ingested ideas through T1→T4 research tiers (default: off)",
+    ),
 ) -> None:
     """Create vault notes from name:description pairs.
 
@@ -501,6 +505,9 @@ def ingest_cmd(
         for fn, msg in result.errors:
             console.print(f"  [red]✗[/red] {fn}: {msg}")
         raise typer.Exit(1)
+
+    if cascade and result.created:
+        _run_cascade(result.created, vault_path)
 
 
 # --- Enrich command ----------------------------------------------------------
@@ -706,6 +713,93 @@ def score_cmd(
         table.add_row(str(rank), idea_id, f"{score:.3f}")
     console.print(table)
     console.print(f"\n[bold]{len(result.scored)} ideas scored[/bold]")
+
+
+def _run_cascade(new_idea_ids: list[str], vault_path: Path) -> None:
+    """Auto-advance newly created ideas through research tiers T1→T4 based on rank.
+
+    For each new idea:
+      - T1: always researched (no rank gate)
+      - T2-T4: researched only if the idea's rank is within the tier limit after re-scoring
+    """
+    import subprocess
+
+    from idea_pipeline.research.web import resolve_tier_limit
+
+    if not new_idea_ids:
+        return
+
+    console.print(f"\n[bold cyan]Cascade:[/bold cyan] advancing {len(new_idea_ids)} new idea(s) through T1→T4\n")
+
+    # T1: research all new ideas unconditionally
+    console.print(f"  [bold]T1[/bold] — researching {len(new_idea_ids)} idea(s)…")
+    ids_arg = ",".join(new_idea_ids)
+    result = subprocess.run(
+        [sys.executable, "-m", "idea_pipeline.cli", "research", "--tier", "1", "--include", ids_arg],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        console.print(f"  [red]✗ T1 research failed (exit {result.returncode})[/red]")
+        return
+
+    # For T2-T4: re-score after each tier, then check rank vs limit
+    eligible_ids = list(new_idea_ids)  # ideas still eligible to advance
+
+    for tier in [2, 3, 4]:
+        # Re-score vault to get current rankings
+        score_result = score_vault(vault_path, dry_run=False)
+        scored_ids = [idea_id for idea_id, _ in score_result.scored]
+        vault_size = len(scored_ids)
+        tier_limit = resolve_tier_limit(tier, vault_size, None)
+
+        # Determine which eligible ideas are within the tier limit
+        advanced: list[str] = []
+        stopped: list[str] = []
+        for idea_id in eligible_ids:
+            if idea_id in scored_ids:
+                rank = scored_ids.index(idea_id) + 1  # 1-based
+            else:
+                rank = vault_size + 1  # unscored → outside limit
+            if rank <= tier_limit:
+                advanced.append(idea_id)
+                console.print(
+                    f"  [green]↑[/green] {idea_id} advanced to T{tier} (rank #{rank}, limit={tier_limit})"
+                )
+            else:
+                stopped.append(idea_id)
+                console.print(
+                    f"  [dim]–[/dim] {idea_id} stopped at T{tier - 1} (rank #{rank}, limit={tier_limit})"
+                )
+
+        if not advanced:
+            console.print(f"  [dim]No ideas advanced to T{tier} — cascade complete.[/dim]")
+            return
+
+        # Research only the advanced ideas at this tier
+        ids_arg = ",".join(advanced)
+        console.print(f"  [bold]T{tier}[/bold] — researching {len(advanced)} idea(s)…")
+        result = subprocess.run(
+            [sys.executable, "-m", "idea_pipeline.cli", "research", "--tier", str(tier), "--include", ids_arg],
+            capture_output=False,
+        )
+        if result.returncode != 0:
+            console.print(f"  [red]✗ T{tier} research failed (exit {result.returncode})[/red]")
+            return
+
+        eligible_ids = advanced  # only advanced ideas remain eligible for next tier
+
+    # Final re-score after T4
+    score_result = score_vault(vault_path, dry_run=False)
+    scored_ids = [idea_id for idea_id, _ in score_result.scored]
+    vault_size = len(scored_ids)
+    tier_limit = resolve_tier_limit(4, vault_size, None)
+    for idea_id in eligible_ids:
+        rank = (scored_ids.index(idea_id) + 1) if idea_id in scored_ids else vault_size + 1
+        console.print(
+            f"  [green]✓[/green] {idea_id} completed T4 (rank #{rank})"
+        )
+
+    console.print("\n[bold cyan]Cascade complete.[/bold cyan]")
 
 
 def _auto_commit_and_push(tier: int, n_researched: int, project_root: Path, vault_path: Path) -> None:
@@ -1354,6 +1448,7 @@ def generate_cmd(
     limit: int = typer.Option(5, "--limit", "-n", help="Max vault ideas to process (Path B only)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Research + analyze but don't write to vault"),
     select: Optional[str] = typer.Option(None, "--select", help="Non-interactive selection, e.g. '1,3'"),
+    cascade: bool = typer.Option(True, "--cascade/--no-cascade", help="Auto-advance new ideas through T1→T4 research tiers"),
 ) -> None:
     """Generate focused business ideas by analyzing domain bottlenecks.
 
@@ -1429,8 +1524,15 @@ def generate_cmd(
 
         all_written.extend(result.written)
 
+    if dry_run and cascade:
+        console.print(f"\n[dim]Would cascade {len(domains)} new idea(s) through tiers T1→T4 (--cascade)[/dim]")
+
     if not dry_run and all_written:
-        console.print(f"\n[green]✓[/green] {len(all_written)} new idea(s) written to vault. Run [bold]ideapipe score --version v2.1[/bold] to score them.")
+        console.print(f"\n[green]✓[/green] {len(all_written)} new idea(s) written to vault.")
+        if cascade:
+            _run_cascade(all_written, vault_path)
+        else:
+            console.print("Run [bold]ideapipe score --version v2.1[/bold] to score them.")
 
 
 if __name__ == "__main__":
