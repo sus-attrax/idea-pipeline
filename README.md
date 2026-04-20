@@ -77,6 +77,7 @@ ideapipe research --tier 1               # all ideas
 ideapipe research --tier 2               # top 100 (auto-pushes leaderboard)
 ideapipe research --tier 3               # top 50
 ideapipe research --tier 4               # top 25
+# ideapipe research --tier 5               # optional, top 5 only, ~$3/idea
 
 # 4. Synthesize
 ideapipe select-hypotheses               # pick 5–10 diverse T4 ideas
@@ -100,7 +101,7 @@ ideapipe generate --from-vault
 
 | File | Contents |
 |------|----------|
-| `LEADERBOARD.md` | All 199+ ideas ranked by v2.1 score |
+| `LEADERBOARD.md` | All ideas ranked by v2.1 score |
 | `LEADERBOARD_T3.md` | Only T3+ researched ideas |
 | `LEADERBOARD_T4.md` | Only T4+ researched ideas |
 | `HYPOTHESES.md` | 5–10 diverse working hypotheses with next steps |
