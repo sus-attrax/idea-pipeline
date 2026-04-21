@@ -1,12 +1,15 @@
 # Idea Pipeline — Agent Handoff
 
 ## Current State
-*(Update this section at the end of every work session)*
-- 199+ ideas in vault, scoring v2.1 active
-- Research: T1=all, T2=100 (or pct-limited), T3=53, T4=9
+*(Update this section at the end of every work session — 2026-04-21)*
+- **199 ideas** in vault, scoring v2.1 active and stable
+- Research coverage: T1=all 199, T2=100, T3=53, T4=9 (actual Firecrawl scrapes)
 - Enrich-intrinsic: full corpus run complete (no top-4 bias)
 - Generator: implemented (Path A: --domain, Path B: --from-vault, --cascade active)
 - Commands: ingest, enrich, link, enrich-intrinsic, score, research, report, generate, select-hypotheses, full-report
+- **LEADERBOARD.md**: all 199 ideas; **LEADERBOARD_T3.md**: 53 ideas; **LEADERBOARD_T4.md**: 9 ideas with confirmed T4 data
+- **FULL_REPORT.md**: all 25 T4-tier candidates (top 25 by score), including those without a successful Firecrawl scrape — falls back to best available tier data
+- **HYPOTHESES.md**: not yet generated — run `ideapipe select-hypotheses` when ready
 
 ## Vault Path
 `$IDEAPIPE_VAULT` or `~/vaults/idea-validation`
@@ -62,9 +65,9 @@ Scale: 1 = best, 6 = worst. Internal: inverted log scale.
 - T1 Tavily: all ideas (free pre-sort)
 - T2 Claude+Web: top 100 or 50% of vault
 - T3 Perplexity: top 50 or 25% of vault
-- T4 Firecrawl: top 25 or 12% of vault
+- T4 Firecrawl: top 25 or 12% of vault (9 of 25 successfully scraped to date)
 - T4 → select-hypotheses: 5–10 diverse picks → HYPOTHESES.md
-- T4 → full-report: all findings → FULL_REPORT.md
+- T4 → full-report: all 25 T4-tier candidates → FULL_REPORT.md (uses best available data per idea, not only T4✓)
 
 ## Invariants (never break these)
 1. Always `--dry-run` before real API call or vault write
@@ -81,12 +84,20 @@ Scale: 1 = best, 6 = worst. Internal: inverted log scale.
 - New CLI command: add `@app.command()` to `cli.py`
 - New prompt: add to `config/prompts/{tier}/filename.txt`, load path in source module
 
-## Where We Left Off
-*(Agent: update this line at session end)*
-Finalization plan fully executed (2026-04-20). All 9 tasks complete.
-Recommended next steps:
-- Run ideapipe select-hypotheses and commit HYPOTHESES.md
-- Run ideapipe full-report and commit FULL_REPORT.md
-- Replenish Firecrawl credits, run T4 on remaining top-25 ideas
-- Replenish Perplexity credits, run T3 on remaining top-50 ideas
-- For top 3 hypotheses: run T5 autoresearch
+## Current Pipeline Status
+*(Agent: update this section at session end — 2026-04-21)*
+
+**The pipeline is complete and production-ready. No pending implementation tasks.**
+
+All commands are implemented and tested. The vault, scoring, research tiers, generator, and report commands are stable. Data outputs (LEADERBOARD.md, FULL_REPORT.md) are current and committed.
+
+### What's available to run next (all optional, no code changes needed)
+- `ideapipe select-hypotheses` → generates HYPOTHESES.md (not yet run)
+- `ideapipe research --tier 4` → expand T4 coverage beyond 9 ideas (needs Firecrawl credits)
+- `ideapipe research --tier 3` → expand T3 coverage beyond 53 ideas (needs Perplexity credits)
+- `ideapipe research --tier 5 <slug>` → deep autonomous research on a specific hypothesis (needs credits)
+- `ideapipe generate --domain "X"` or `--from-vault` → generate new ideas
+
+### External blockers (not code issues)
+- Firecrawl credits exhausted → top-up to run more T4
+- Perplexity credits exhausted → top-up to run more T3
