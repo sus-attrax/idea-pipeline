@@ -810,9 +810,12 @@ def _auto_commit_and_push(tier: int, n_researched: int, project_root: Path, vaul
     console.print(f"\n[bold]Auto-push:[/bold] generating {leaderboard_path.name} ...")
 
     # Generate the leaderboard via subprocess using the same Python interpreter
+    report_args = [sys.executable, "-m", "idea_pipeline", "report",
+                   f"--min-tier={tier}", f"--out=LEADERBOARD_T{tier}.md"]
+    if tier >= 4:
+        report_args.append("--include-candidates")
     gen_result = subprocess.run(
-        [sys.executable, "-m", "idea_pipeline", "report",
-         f"--min-tier={tier}", f"--out=LEADERBOARD_T{tier}.md"],
+        report_args,
         capture_output=True,
         text=True,
         cwd=str(project_root),
@@ -1094,12 +1097,13 @@ def report_cmd(
     version: str = typer.Option("v2.1", "--version", help="v1 or v2.1 column layout"),
     min_tier: Optional[int] = typer.Option(None, "--min-tier", help="Only include ideas at this research tier or higher (1–5)"),
     ids: Optional[str] = typer.Option(None, "--ids", help="Comma-separated idea IDs to include (all others excluded)"),
+    include_candidates: bool = typer.Option(False, "--include-candidates", help="Also include (min_tier-1) ideas selected as candidates, marked as such"),
 ) -> None:
     """Write a ranked markdown leaderboard of all scored ideas."""
     import datetime
     import yaml
 
-    from idea_pipeline.research.web import tier_level
+    from idea_pipeline.research.web import resolve_tier_limit, tier_level
 
     vault_path = get_vault_path(vault)
     if not vault_path.is_dir():
@@ -1108,7 +1112,13 @@ def report_cmd(
 
     ids_set = {i.strip() for i in ids.split(",")} if ids else set()
 
-    ideas: list[dict] = []
+    # Determine candidate floor: when --include-candidates is active and min_tier >= 2,
+    # also load ideas one tier below so candidates without target-tier data are shown.
+    candidate_floor = (max(1, min_tier - 1) if (include_candidates and min_tier is not None and min_tier >= 2)
+                       else min_tier)
+
+    all_idea_rows: list[dict] = []
+    vault_size = 0
     for f in vault_path.glob("*.md"):
         text = f.read_text(encoding="utf-8")
         if not text.startswith("---"):
@@ -1125,13 +1135,23 @@ def report_cmd(
             db = [db]
         if not any("geschaeftsideen" in str(d) for d in db):
             continue
+        vault_size += 1
         if meta.get("score") is None:
             continue
-        if min_tier is not None and tier_level(meta.get("research_fidelity")) < min_tier:
+        if candidate_floor is not None and tier_level(meta.get("research_fidelity")) < candidate_floor:
             continue
         if ids_set and f.stem not in ids_set:
             continue
-        ideas.append({"id": f.stem, **meta})
+        all_idea_rows.append({"id": f.stem, **meta})
+
+    all_idea_rows.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # When include_candidates: keep only the top-N that would have been selected for min_tier research.
+    if include_candidates and min_tier is not None and min_tier >= 2:
+        pool_limit = resolve_tier_limit(min_tier, vault_size, None)
+        ideas = all_idea_rows[:pool_limit]
+    else:
+        ideas = all_idea_rows
 
     ideas.sort(key=lambda x: x.get("score", 0), reverse=True)
 
@@ -1166,7 +1186,12 @@ def report_cmd(
             sb = m.get("score_breakdown") or {}
             cd = "✓" if sb.get("cross_domain_flag") else "·"
             kill = "💀" if sb.get("killer_flag") else "·"
-            res = tier_badge_map.get(m.get("research_fidelity") or "", "—")
+            idea_tier = tier_level(m.get("research_fidelity"))
+            # Mark candidates selected for target tier but without new data
+            if include_candidates and min_tier is not None and idea_tier < min_tier:
+                res = f"T{idea_tier}→"
+            else:
+                res = tier_badge_map.get(m.get("research_fidelity") or "", "—")
             lines.append(
                 f"| {rank} "
                 f"| {m['id']} "
@@ -1189,7 +1214,7 @@ def report_cmd(
             "---",
             "",
             "**Column guide**",
-            "- **Res**: research tier (T1–T5; T4✓/T5✓ = Firecrawl/AutoResearch data present)",
+            "- **Res**: research tier (T1–T5; T4✓/T5✓ = Firecrawl/AutoResearch data present; T3→ = selected as T4 candidate, no T4 data yet)",
             "- **Cap**: capital_class (boot=bootstrappable, seed=seed, vc=vc_dependent)",
             "- **Reg**: regulation_class (un=unregulated, lo=low, hi=high)",
             "- **Kill**: 💀 = killer_flag (vc_dependent + high regulation)",
@@ -1874,27 +1899,33 @@ def full_report_cmd(
         console.print(f"[red]✗ Vault not found:[/red] {vault_path}")
         raise typer.Exit(1)
 
-    # Load and filter ideas
+    # Load candidates: ideas at (min_tier - 1) or higher, up to limit.
+    # This includes ideas selected for T{min_tier} research that didn't yield new data.
+    candidate_floor = max(1, min_tier - 1)
     all_notes = list_notes(vault_path, IdeeNote).notes
     eligible: list[IdeeNote] = [
         vn.model for vn in all_notes
-        if vn.model.score is not None and tier_level(vn.model.research_fidelity) >= min_tier
+        if vn.model.score is not None and tier_level(vn.model.research_fidelity) >= candidate_floor
     ]
     eligible.sort(key=lambda m: m.score or 0, reverse=True)
     ideas = eligible[:limit]
 
     total_eligible = len(eligible)
+    n_with_data = sum(1 for i in ideas if tier_level(i.research_fidelity) >= min_tier)
+    n_candidates = len(ideas) - n_with_data
 
     if dry_run:
         console.print(
             f"[bold yellow]Dry run[/bold yellow] — "
-            f"{total_eligible} ideas at tier{min_tier}+, would include {len(ideas)} (limit={limit}).\n"
+            f"{total_eligible} ideas at tier{candidate_floor}+, would include {len(ideas)} (limit={limit}): "
+            f"{n_with_data} with T{min_tier} data, {n_candidates} candidates without.\n"
             f"Preview of first 3:\n"
         )
         for rank, idea in enumerate(ideas[:3], 1):
             sb = idea.score_breakdown or {}
+            no_data = " [yellow](no T{} data)[/yellow]".format(min_tier) if tier_level(idea.research_fidelity) < min_tier else ""
             console.print(
-                f"  [bold]#{rank}[/bold] [cyan]{idea.id}[/cyan]  "
+                f"  [bold]#{rank}[/bold] [cyan]{idea.id}[/cyan]{no_data}  "
                 f"score={idea.score:.3f}  tier={idea.research_fidelity}  "
                 f"capital={idea.capital_class or '—'}  "
                 f"wtp={idea.willingness_to_pay}/6"
@@ -1908,12 +1939,15 @@ def full_report_cmd(
         return
 
     if not ideas:
-        console.print(f"[yellow]No ideas found at tier{min_tier}+ with a score.[/yellow]")
+        console.print(f"[yellow]No ideas found at tier{candidate_floor}+ with a score.[/yellow]")
         raise typer.Exit(0)
 
-    console.print(f"Building full report for [bold]{len(ideas)}[/bold] ideas (tier{min_tier}+) ...")
+    console.print(
+        f"Building full report for [bold]{len(ideas)}[/bold] ideas "
+        f"({n_with_data} with T{min_tier} data, {n_candidates} candidates without) ..."
+    )
 
-    report_text = build_full_report(ideas, vault_path)
+    report_text = build_full_report(ideas, vault_path, target_tier=min_tier)
 
     if not out.is_absolute():
         repo_root = Path(__file__).resolve().parent.parent.parent

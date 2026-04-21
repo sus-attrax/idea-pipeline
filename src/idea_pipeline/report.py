@@ -74,6 +74,7 @@ def _render_idea_section(
     idea: IdeeNote,
     chance_notes_by_id: dict[str, ChanceNote],
     wissen_notes_by_id: dict[str, WissenNote],
+    target_tier: int = 0,
 ) -> str:
     """Render a single idea's full-report section as markdown."""
     lines: list[str] = []
@@ -96,6 +97,13 @@ def _render_idea_section(
         f"Capital: {capital} | Regulation: {regulation}"
     )
     lines.append("")
+
+    if target_tier > 0 and tier_num < target_tier:
+        lines.append(
+            f"> ⚠ **No additional T{target_tier} data obtained** — "
+            f"selected as T{target_tier} candidate but research yielded no new results."
+        )
+        lines.append("")
 
     # --- Score Breakdown ---
     lines.append("### Score Breakdown")
@@ -242,11 +250,13 @@ def _render_idea_section(
 def build_full_report(
     ideas: list[IdeeNote],
     vault_path: Path,
+    target_tier: int = 0,
 ) -> str:
     """Build a full markdown report for the given list of ideas.
 
     Loads linked ChanceNotes and WissenNotes from vault to include their details.
     Ideas should already be sorted by rank (descending score).
+    target_tier: if set, ideas below this tier are flagged as candidates without data.
     """
     today = datetime.date.today().isoformat()
 
@@ -278,6 +288,7 @@ def build_full_report(
             idea=idea,
             chance_notes_by_id=chance_notes_by_id,
             wissen_notes_by_id=wissen_notes_by_id,
+            target_tier=target_tier,
         )
         idea_sections.append(section)
 
