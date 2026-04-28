@@ -67,8 +67,15 @@ class FirecrawlResearcher:
         if not sections:
             return {}, ""
 
-        scores, narrative = self._extract(description, "\n\n---\n\n".join(sections), scraped_urls)
-        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        scores, narrative, insights = self._extract(
+            description, "\n\n---\n\n".join(sections), scraped_urls
+        )
+        cache_set(cache_key, self.SOURCE, {
+            **scores,
+            "narrative": narrative,
+            "sources": scraped_urls,
+            "insights": insights,
+        })
         return scores, narrative
 
     def _search_urls(self, description: str) -> list[tuple[str, str]]:
@@ -100,7 +107,9 @@ class FirecrawlResearcher:
         cache_set(url, self.SOURCE, {"markdown": markdown})
         return markdown or None
 
-    def _extract(self, description: str, combined_md: str, sources: list[str]) -> tuple[dict, str]:
+    def _extract(
+        self, description: str, combined_md: str, sources: list[str]
+    ) -> tuple[dict, str, dict]:
         payload = {
             "idea_description": description[:400],
             "combined_markdown": combined_md,
@@ -115,6 +124,13 @@ class FirecrawlResearcher:
             )
             data = parse_json(resp.content[0].text)
         except Exception:
-            return {}, ""
+            return {}, "", {}
+
+        if not isinstance(data, dict):
+            return {}, "", {}
+
         scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
-        return scores, data.get("narrative", "")
+        insights = data.get("insights") or {}
+        if not isinstance(insights, dict):
+            insights = {}
+        return scores, data.get("narrative", ""), insights

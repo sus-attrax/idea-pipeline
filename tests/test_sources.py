@@ -122,3 +122,50 @@ def test_t3_citations_and_insights_cached():
     assert cached["sources"] == ["https://perplexity.ai/cite/1", "https://perplexity.ai/cite/2"]
     assert cached["insights"]["verdict"] == "Pursue"
     assert cached["insights"]["timing"] == "New EU regulation opens niche."
+
+
+def test_t4_extract_returns_three_tuple():
+    """firecrawl _extract returns (scores, narrative, insights) 3-tuple."""
+    mock_llm = MagicMock()
+    mock_llm.messages.create.return_value = MagicMock(
+        content=[MagicMock(text=json.dumps({
+            "market_size": 1,
+            "market_potential": 2,
+            "prevalence": 2,
+            "market_awareness": 2,
+            "narrative": "Dominant market.",
+            "insights": {
+                "timing": "Post-COVID shift.",
+                "bottlenecks": "Enterprise sales cycle is 18 months.",
+                "risk_flags": ["Execution Risk"],
+                "risk_justification": "Long sales cycles risk runway.",
+                "moat": "Proprietary integrations.",
+                "gtm_bottleneck": "First: Head of Operations at 200-person SaaS company.",
+                "gross_margin": "SaaS >70% fits.",
+                "verdict": "Pursue",
+                "verdict_reason": "Strong tailwind + defensible.",
+                "next_step": "Run 3 pilot calls with ops leads.",
+            },
+        }))]
+    )
+
+    with patch("idea_pipeline.research.sources.firecrawl.cache_get", return_value=None), \
+         patch("idea_pipeline.research.sources.firecrawl.cache_set", lambda q, s, d: None), \
+         patch("idea_pipeline.research.sources.firecrawl.get_anthropic", return_value=mock_llm):
+        from idea_pipeline.research.sources.firecrawl import FirecrawlResearcher
+        r = FirecrawlResearcher.__new__(FirecrawlResearcher)
+        r._llm = mock_llm
+        r._prompt = "test prompt"
+        r._fc = MagicMock()
+
+        result = r._extract(
+            "B2B compliance tool",
+            "### https://market.com/report\n\nContent here",
+            ["https://market.com/report"],
+        )
+
+    assert len(result) == 3, "Expected 3-tuple (scores, narrative, insights)"
+    scores, narrative, insights = result
+    assert insights["verdict"] == "Pursue"
+    assert insights["timing"] == "Post-COVID shift."
+    assert narrative == "Dominant market."
