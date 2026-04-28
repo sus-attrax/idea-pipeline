@@ -105,3 +105,38 @@ def test_fetch_insights_no_narratives_returns_empty():
         from idea_pipeline.report import _fetch_or_synthesize_insights
         result = _fetch_or_synthesize_insights("idea-empty", tier_num=1, narratives={})
     assert result == {}
+
+
+def test_render_idea_section_includes_insight_sections():
+    """_render_idea_section integrates insights and renders 7 sections."""
+    from idea_pipeline.schemas import IdeeNote
+    from idea_pipeline.report import _render_idea_section
+
+    idea = IdeeNote(
+        id="test-slug",
+        score=0.75,
+        score_breakdown={
+            "market_score": 0.8, "fit_score": 0.7,
+            "chance_score": 0.6, "attractiveness_score": 0.9,
+        },
+        research_fidelity="tier3",
+    )
+
+    mock_llm = MagicMock()
+    mock_llm.messages.create.return_value = MagicMock(
+        content=[MagicMock(text=json.dumps(_SAMPLE_INSIGHTS))]
+    )
+
+    with patch("idea_pipeline.report.cache_get", lambda q, s: None), \
+         patch("idea_pipeline.report.cache_set", lambda q, s, d: None), \
+         patch("idea_pipeline.report.get_anthropic", return_value=mock_llm), \
+         patch("idea_pipeline.report.read_prompt", return_value="prompt"):
+        output = _render_idea_section(
+            rank=1, idea=idea, chance_notes_by_id={}, wissen_notes_by_id={}
+        )
+
+    assert "### Timing" in output
+    assert "New EU regulation" in output
+    assert "### Verdict" in output
+    assert "🟢" in output
+    assert "Interview 5 CFOs" in output

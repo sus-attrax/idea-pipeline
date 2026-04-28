@@ -333,10 +333,13 @@ def _render_idea_section(
     lines.append(f"- Killer Flag: {killer}")
     lines.append("")
 
-    # --- Research Findings ---
+    # --- Research Findings (T1–T4 narratives) ---
     lines.append("### Research Findings")
-    # Compute average prevalence from linked ChanceNotes (prevalence lives on ChanceNote, not IdeeNote)
-    linked_chances = [chance_notes_by_id[cid] for cid in (idea.chancen or []) if cid in chance_notes_by_id]
+    linked_chances = [
+        chance_notes_by_id[cid]
+        for cid in (idea.chancen or [])
+        if cid in chance_notes_by_id
+    ]
     if linked_chances:
         avg_prev: str = f"{sum(c.prevalence for c in linked_chances) / len(linked_chances):.1f}"
     else:
@@ -349,35 +352,51 @@ def _render_idea_section(
     )
     lines.append("")
 
-    # T2
+    # Seed narratives with T1 summary so synthesis always has minimal context
+    narratives: dict[str, str] = {
+        "tier1": (
+            f"Idea: {idea.id}. "
+            f"Market size {idea.market_size}/6, "
+            f"potential {idea.market_potential}/6, "
+            f"awareness {idea.market_awareness}/6. "
+            f"Score: {score:.3f}."
+        )
+    }
+
     if tier_num >= 2:
         n2 = _fetch_narrative(idea.id, "tier2")
         if n2:
+            narratives["tier2"] = n2
             lines.append("**T2 (Claude + Web Search):**")
             lines.append(_blockquote(n2))
             lines.append("")
 
-    # T3
     if tier_num >= 3:
         n3 = _fetch_narrative(idea.id, "tier3")
         if n3:
+            narratives["tier3"] = n3
             lines.append("**T3 (Perplexity):**")
             lines.append(_blockquote(n3))
             lines.append("")
 
-    # T4
     if tier_num >= 4:
         n4 = _fetch_narrative(idea.id, "tier4")
         if n4:
+            narratives["tier4"] = n4
             lines.append("**T4 (Firecrawl):**")
             lines.append(_blockquote(n4))
             lines.append("")
 
-    # T5 / manual research_notes
     if idea.research_notes:
         lines.append("**Research Notes (T5/manual):**")
         lines.append(_blockquote(idea.research_notes))
         lines.append("")
+
+    # --- 7 Qualitative Insight Sections ---
+    insights = _fetch_or_synthesize_insights(idea.id, tier_num, narratives)
+    insights_md = _render_insights_sections(insights)
+    if insights_md:
+        lines.append(insights_md)
 
     # --- Linked Problem Fields ---
     lines.append("### Linked Problem Fields")
