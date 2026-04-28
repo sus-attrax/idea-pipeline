@@ -245,6 +245,89 @@ def _render_insights_sections(insights: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-idea meta section
+# ---------------------------------------------------------------------------
+
+def _render_meta_section(data: dict) -> str:
+    """Render executive summary + thematic sections from meta dict."""
+    if not data:
+        return ""
+
+    lines: list[str] = []
+
+    exec_summary = data.get("executive_summary") or ""
+    if exec_summary:
+        lines += ["## Executive Summary", "", exec_summary, "", "---", ""]
+
+    thematic = data.get("thematic_sections") or {}
+    section_labels = [
+        ("market_timing", "Markt & Timing"),
+        ("technology",    "Technologie & Machbarkeit"),
+        ("regulatory",    "Regulatorik"),
+        ("competition",   "Wettbewerb"),
+        ("business_model","Geschäftsmodell"),
+    ]
+    if any(thematic.get(k) for k, _ in section_labels):
+        lines += ["## Thematische Analyse", ""]
+        for key, label in section_labels:
+            text = thematic.get(key) or ""
+            if text:
+                lines += [f"### {label}", text, ""]
+        lines += ["---", ""]
+
+    return "\n".join(lines)
+
+
+def _fetch_or_build_meta_section(ideas: list, narratives_by_id: dict) -> str:
+    """Return cross-idea executive summary + thematic sections as markdown.
+
+    Keyed by SHA-256 hash of sorted idea IDs so the cache entry auto-invalidates
+    when the idea set changes. Empty string if no narratives available.
+    """
+    import hashlib
+
+    idea_ids_sorted = sorted(i.id for i in ideas)
+    meta_hash = hashlib.sha256("|".join(idea_ids_sorted).encode()).hexdigest()[:16]
+    cache_key = f"report_meta:v1:{meta_hash}"
+    source = "report_meta_v1"
+
+    cached = cache_get(cache_key, source)
+    if cached and isinstance(cached, dict):
+        return _render_meta_section(cached)
+
+    combined_parts = [
+        f"### {idea_id}\n{narratives_by_id.get(idea_id, '')}"
+        for idea_id in idea_ids_sorted
+        if narratives_by_id.get(idea_id)
+    ]
+    if not combined_parts:
+        return ""
+    combined = "\n\n---\n\n".join(combined_parts)[:15000]
+
+    try:
+        prompt = read_prompt("report_meta_synthesis.txt")
+        llm = get_anthropic()
+        resp = llm.messages.create(
+            model=_SONNET,
+            max_tokens=3000,
+            system=prompt,
+            messages=[{
+                "role": "user",
+                "content": json.dumps({"narratives": combined}, ensure_ascii=False),
+            }],
+        )
+        data = parse_json(resp.content[0].text)
+    except Exception:
+        return ""
+
+    if not isinstance(data, dict):
+        return ""
+
+    cache_set(cache_key, source, data)
+    return _render_meta_section(data)
+
+
+# ---------------------------------------------------------------------------
 # Progress-bar helpers
 # ---------------------------------------------------------------------------
 
@@ -458,13 +541,18 @@ def build_full_report(
 ) -> str:
     """Build a full markdown report for the given list of ideas.
 
-    Loads linked ChanceNotes and WissenNotes from vault to include their details.
+    Report structure:
+    1. Header
+    2. Cross-idea Executive Summary + Thematic Analysis (lazy LLM, cached)
+    3. Per-idea sections with score breakdown, narratives, 7 insight sections
+    4. Bibliography (all sources by tier, deduplicated)
+
     Ideas should already be sorted by rank (descending score).
-    target_tier: if set, ideas below this tier are flagged as candidates without data.
+    target_tier: if set, ideas below this tier get a warning banner.
+    LLM calls are only made when not already cached.
     """
     today = datetime.date.today().isoformat()
 
-    # Load linked note details from vault
     chance_notes_by_id: dict[str, ChanceNote] = {
         vn.model.id: vn.model
         for vn in list_notes(vault_path, ChanceNote).notes
@@ -473,6 +561,15 @@ def build_full_report(
         vn.model.id: vn.model
         for vn in list_notes(vault_path, WissenNote).notes
     }
+
+    # Collect best available narrative per idea for cross-idea synthesis
+    narratives_by_id: dict[str, str] = {}
+    for idea in ideas:
+        for tier_key in ("tier4", "tier3", "tier2"):
+            n = _fetch_narrative(idea.id, tier_key)
+            if n:
+                narratives_by_id[idea.id] = n
+                break
 
     header_lines = [
         f"# Full Idea Report — {today}",
@@ -485,6 +582,8 @@ def build_full_report(
         "",
     ]
 
+    meta_md = _fetch_or_build_meta_section(ideas, narratives_by_id)
+
     idea_sections: list[str] = []
     for rank, idea in enumerate(ideas, 1):
         section = _render_idea_section(
@@ -496,4 +595,12 @@ def build_full_report(
         )
         idea_sections.append(section)
 
-    return "\n".join(header_lines) + "\n".join(idea_sections)
+    bib_md = _build_bibliography(ideas)
+
+    return (
+        "\n".join(header_lines)
+        + meta_md
+        + "\n".join(idea_sections)
+        + "\n"
+        + bib_md
+    )

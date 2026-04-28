@@ -80,3 +80,59 @@ def test_build_bibliography_deduplicates_urls():
         bib = _build_bibliography([idea_a, idea_b])
 
     assert bib.count("https://same.com") == 1
+
+
+def test_render_meta_section_from_cached_data():
+    cached_meta = {
+        "executive_summary": "Across all ideas, strong SaaS signals dominate [idea-a].",
+        "thematic_sections": {
+            "market_timing": "Most ideas target post-2023 regulatory shifts.",
+            "technology": "AI automation is the common enabler.",
+            "regulatory": "GDPR and EU AI Act create moats.",
+            "competition": "Most markets have 2-3 incumbents.",
+            "business_model": "SaaS pricing is the dominant model.",
+        }
+    }
+    idea_a = MagicMock()
+    idea_a.id = "idea-a"
+
+    with patch("idea_pipeline.report.cache_get", lambda q, s: cached_meta if "report_meta" in q else None):
+        from idea_pipeline.report import _fetch_or_build_meta_section
+        result = _fetch_or_build_meta_section([idea_a], {})
+
+    assert "## Executive Summary" in result
+    assert "strong SaaS signals" in result
+    assert "## Thematische Analyse" in result
+    assert "### Markt & Timing" in result
+    assert "post-2023 regulatory shifts" in result
+
+
+def test_render_meta_section_empty_dict_returns_empty():
+    from idea_pipeline.report import _render_meta_section
+    assert _render_meta_section({}) == ""
+
+
+def test_build_full_report_contains_required_sections():
+    """build_full_report output contains the bibliography heading."""
+    from idea_pipeline.schemas import IdeeNote
+    from idea_pipeline.report import build_full_report
+    from pathlib import Path
+
+    idea = IdeeNote(id="slug-1", score=0.8, research_fidelity="tier2")
+
+    mock_llm = MagicMock()
+    mock_llm.messages.create.return_value = MagicMock(
+        content=[MagicMock(text="{}")]
+    )
+
+    with patch("idea_pipeline.report.list_notes") as mock_ln, \
+         patch("idea_pipeline.report.cache_get", lambda q, s: None), \
+         patch("idea_pipeline.report.cache_set", lambda q, s, d: None), \
+         patch("idea_pipeline.report.get_anthropic", return_value=mock_llm), \
+         patch("idea_pipeline.report.read_prompt", return_value="prompt"):
+        mock_ln.return_value = MagicMock(notes=[])
+        output = build_full_report([idea], vault_path=Path("/tmp/fake-vault"))
+
+    assert "# Full Idea Report" in output
+    assert "## Rank #1: slug-1" in output
+    assert "## Literaturverzeichnis" in output
