@@ -59,10 +59,13 @@ class TavilyResearcher:
         unique: list[dict] = []
         for s in all_snippets:
             url = s.get("url", "")
-            if url and url not in seen:
+            if not url:
+                continue  # skip snippets without a URL — cannot deduplicate or cite them
+            if url not in seen:
                 seen.add(url)
                 unique.append(s)
 
+        # "t1:" prefix namespaces this from per-query cache entries (which use the raw query string)
         cache_set(f"t1:{idea_id}", self.SOURCE, {"sources": unique})
         return scores, ""
 
@@ -96,7 +99,8 @@ class TavilyResearcher:
                 system=self._prompt,
                 messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             )
-            score = clamp(parse_json(resp.content[0].text)["score"])
+            parsed = parse_json(resp.content[0].text)
+            score = clamp(parsed.get("score", 4)) if isinstance(parsed, dict) else 4
         except Exception:
             score = 4
 
