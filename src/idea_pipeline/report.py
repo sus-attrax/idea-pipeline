@@ -125,6 +125,126 @@ def _build_bibliography(ideas: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Insights helpers
+# ---------------------------------------------------------------------------
+
+_SONNET = "claude-sonnet-4-6"
+
+
+def _fetch_or_synthesize_insights(
+    idea_id: str, tier_num: int, narratives: dict[str, str]
+) -> dict:
+    """Return insights dict for an idea.
+
+    Priority:
+    1. T4 cache entry (insights extracted at research time)
+    2. T3 cache entry (insights extracted at research time)
+    3. Dedicated insights cache (previous synthesis run)
+    4. Fresh Sonnet synthesis from available narratives (result cached)
+    Returns {} if no narratives available and no cache hit.
+    """
+    for check_tier, source_name, cache_key in [
+        (4, "firecrawl_v2",  f"t4:{idea_id}"),
+        (3, "perplexity_v1", f"t3:{idea_id}"),
+    ]:
+        if tier_num >= check_tier:
+            cached = cache_get(cache_key, source_name)
+            if cached and isinstance(cached, dict) and cached.get("insights"):
+                return cached["insights"]
+
+    insights_key = f"insights:v1:{idea_id}"
+    cached_insights = cache_get(insights_key, "insights_v1")
+    if cached_insights:
+        return cached_insights
+
+    combined = "\n\n---\n\n".join(
+        f"### {tier.upper()}\n{text}"
+        for tier, text in narratives.items()
+        if text
+    )
+    if not combined:
+        return {}
+
+    try:
+        prompt = read_prompt("report_insights_synthesis.txt")
+        llm = get_anthropic()
+        resp = llm.messages.create(
+            model=_SONNET,
+            max_tokens=1024,
+            system=prompt,
+            messages=[{
+                "role": "user",
+                "content": json.dumps(
+                    {"idea_id": idea_id, "narratives": combined}, ensure_ascii=False
+                ),
+            }],
+        )
+        data = parse_json(resp.content[0].text)
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    cache_set(insights_key, "insights_v1", data)
+    return data
+
+
+def _render_insights_sections(insights: dict) -> str:
+    """Render the 7 qualitative insight sections as markdown.
+
+    Returns empty string if insights is empty.
+    """
+    if not insights:
+        return ""
+
+    lines: list[str] = []
+
+    timing = insights.get("timing") or ""
+    if timing:
+        lines += ["### Timing", timing, ""]
+
+    bottlenecks = insights.get("bottlenecks") or ""
+    if bottlenecks:
+        lines += ["### Bottlenecks & Critical Assumptions", bottlenecks, ""]
+
+    risk_flags: list[str] = insights.get("risk_flags") or []
+    risk_just = insights.get("risk_justification") or ""
+    if risk_flags or risk_just:
+        lines.append("### Risk Profile")
+        if risk_flags:
+            lines.append(" ".join(f"`{f}`" for f in risk_flags))
+        if risk_just:
+            lines.append(risk_just)
+        lines.append("")
+
+    moat = insights.get("moat") or ""
+    if moat:
+        lines += ["### Moat / Defensibility", moat, ""]
+
+    gtm = insights.get("gtm_bottleneck") or ""
+    if gtm:
+        lines += ["### GTM Bottleneck", gtm, ""]
+
+    margin = insights.get("gross_margin") or ""
+    if margin:
+        lines += ["### Gross Margin", margin, ""]
+
+    verdict = insights.get("verdict") or ""
+    verdict_reason = insights.get("verdict_reason") or ""
+    next_step = insights.get("next_step") or ""
+    if verdict:
+        emoji = {"Pursue": "🟢", "Validate first": "🟡", "Kill": "🔴"}.get(verdict, "⚪")
+        lines.append("### Verdict")
+        lines.append(f"**{emoji} {verdict}** — {verdict_reason}")
+        if next_step:
+            lines.append(f"**Next step:** {next_step}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Progress-bar helpers
 # ---------------------------------------------------------------------------
 
