@@ -987,3 +987,7 @@
 - **gaertnern** — Confidence: 3/6, Enjoyment: 1/6, Credibility: 5/6
 
 ---
+
+## Literaturverzeichnis
+
+_Keine Quellen verfügbar._
