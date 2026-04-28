@@ -7,10 +7,12 @@ narratives (T2/T3/T4), linked problem fields, knowledge areas, and idea notes.
 from __future__ import annotations
 
 import datetime
+import json
 from pathlib import Path
 from typing import Optional
 
-from idea_pipeline.research.cache import cache_get
+from idea_pipeline.research.cache import cache_get, cache_set
+from idea_pipeline.research.sources.base import get_anthropic, parse_json, read_prompt
 from idea_pipeline.schemas import ChanceNote, IdeeNote, WissenNote
 from idea_pipeline.vault_io import list_notes
 
@@ -48,6 +50,78 @@ def _fetch_narrative(idea_id: str, tier_key: str) -> str:
     except Exception:
         pass
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Source helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_sources(idea_id: str, tier: str) -> list:
+    """Fetch cached sources list for the given tier.
+
+    Returns list of dicts (T1/T2: {title, url}) or strings (T3/T4: URLs).
+    Empty list if not available or tier unknown.
+    """
+    source_map = {
+        "tier1": ("tavily_v1",        f"t1:{idea_id}"),
+        "tier2": ("claude_search_v1", f"t2:{idea_id}"),
+        "tier3": ("perplexity_v1",    f"t3:{idea_id}"),
+        "tier4": ("firecrawl_v2",     f"t4:{idea_id}"),
+    }
+    if tier not in source_map:
+        return []
+    source_name, query = source_map[tier]
+    try:
+        result = cache_get(query, source_name)
+        if result and isinstance(result, dict):
+            return result.get("sources", [])
+    except Exception:
+        pass
+    return []
+
+
+def _build_bibliography(ideas: list) -> str:
+    """Build a deduplicated, tier-grouped bibliography from all idea sources."""
+    tiers = ["tier1", "tier2", "tier3", "tier4"]
+    tier_labels = {
+        "tier1": "Quellen T1 (Tavily / LLM-inferred)",
+        "tier2": "Quellen T2 (Claude + Web Search)",
+        "tier3": "Quellen T3 (Perplexity sonar-pro)",
+        "tier4": "Quellen T4 (Firecrawl)",
+    }
+
+    sources_by_tier: dict[str, set[str]] = {t: set() for t in tiers}
+
+    for idea in ideas:
+        for tier in tiers:
+            for src in _fetch_sources(idea.id, tier):
+                if isinstance(src, str):
+                    if src:
+                        sources_by_tier[tier].add(src)
+                elif isinstance(src, dict):
+                    url = src.get("url", "")
+                    title = src.get("title", "")
+                    entry = f"[{title}]({url})" if title and url else url
+                    if entry:
+                        sources_by_tier[tier].add(entry)
+
+    lines = ["## Literaturverzeichnis", ""]
+    has_any = False
+    for tier in tiers:
+        entries = sorted(sources_by_tier[tier])
+        if entries:
+            has_any = True
+            lines.append(f"### {tier_labels[tier]}")
+            lines.append("")
+            for entry in entries:
+                lines.append(f"- {entry}")
+            lines.append("")
+
+    if not has_any:
+        lines.append("_Keine Quellen verfügbar._")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
