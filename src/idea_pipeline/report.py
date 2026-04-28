@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from idea_pipeline.research.cache import cache_get, cache_set
-from idea_pipeline.research.sources.base import get_anthropic, parse_json, read_prompt
+from idea_pipeline.research.cache import cache_get, cache_set  # noqa: F401  # reserved for upcoming LLM enrichment
+from idea_pipeline.research.sources.base import get_anthropic, parse_json, read_prompt  # noqa: F401  # reserved for upcoming LLM enrichment
 from idea_pipeline.schemas import ChanceNote, IdeeNote, WissenNote
 from idea_pipeline.vault_io import list_notes
 
