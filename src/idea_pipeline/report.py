@@ -352,16 +352,7 @@ def _render_idea_section(
     )
     lines.append("")
 
-    # Seed narratives with T1 summary so synthesis always has minimal context
-    narratives: dict[str, str] = {
-        "tier1": (
-            f"Idea: {idea.id}. "
-            f"Market size {idea.market_size}/6, "
-            f"potential {idea.market_potential}/6, "
-            f"awareness {idea.market_awareness}/6. "
-            f"Score: {score:.3f}."
-        )
-    }
+    narratives: dict[str, str] = {}
 
     if tier_num >= 2:
         n2 = _fetch_narrative(idea.id, "tier2")

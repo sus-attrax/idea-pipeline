@@ -127,7 +127,12 @@ def test_render_idea_section_includes_insight_sections():
         content=[MagicMock(text=json.dumps(_SAMPLE_INSIGHTS))]
     )
 
-    with patch("idea_pipeline.report.cache_get", lambda q, s: None), \
+    def fake_cache_get(q, s):
+        if q == "t3:test-slug" and s == "perplexity_v1":
+            return {"narrative": "Strong B2B SaaS market with 25% CAGR.", "sources": [], "insights": {}}
+        return None
+
+    with patch("idea_pipeline.report.cache_get", fake_cache_get), \
          patch("idea_pipeline.report.cache_set", lambda q, s, d: None), \
          patch("idea_pipeline.report.get_anthropic", return_value=mock_llm), \
          patch("idea_pipeline.report.read_prompt", return_value="prompt"):
