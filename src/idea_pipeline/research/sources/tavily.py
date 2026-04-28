@@ -27,13 +27,17 @@ _QUERY_TEMPLATES = {
     "market_awareness": "{description} consumer awareness adoption rate survey",
 }
 
+try:
+    from tavily import TavilyClient
+except ImportError:
+    TavilyClient = None  # type: ignore
+
 
 class TavilyResearcher:
     SOURCE = "tavily_v1"
     FIDELITY = "tier1"
 
     def __init__(self):
-        from tavily import TavilyClient
         api_key = os.environ.get("TAVILY_API_KEY", "")
         if not api_key or api_key.startswith("tvly-..."):
             raise RuntimeError("TAVILY_API_KEY not set in .env")
@@ -42,19 +46,30 @@ class TavilyResearcher:
         self._prompt = read_prompt("research_t1_extract.txt")
 
     def research_idea(self, idea_id: str, description: str) -> tuple[dict[str, int], str]:
-        scores = {
-            field: self._score_field(
-                field, description,
-                _QUERY_TEMPLATES[field].format(description=description[:200])
-            )
-            for field in RESEARCH_FIELDS
-        }
+        all_snippets: list[dict] = []
+        scores: dict[str, int] = {}
+        for field in RESEARCH_FIELDS:
+            query = _QUERY_TEMPLATES[field].format(description=description[:200])
+            score, snippets = self._score_field(field, description, query)
+            scores[field] = score
+            all_snippets.extend(snippets)
+
+        # Deduplicate by URL, preserve insertion order
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for s in all_snippets:
+            url = s.get("url", "")
+            if url and url not in seen:
+                seen.add(url)
+                unique.append(s)
+
+        cache_set(f"t1:{idea_id}", self.SOURCE, {"sources": unique})
         return scores, ""
 
-    def _score_field(self, field: str, description: str, query: str) -> int:
+    def _score_field(self, field: str, description: str, query: str) -> tuple[int, list[dict]]:
         cached = cache_get(query, self.SOURCE)
         if cached is not None:
-            return cached.get("score", 4)
+            return cached.get("score", 4), cached.get("snippets", [])
 
         try:
             results = self._client.search(query=query, search_depth="basic", max_results=5)
@@ -67,7 +82,7 @@ class TavilyResearcher:
                 for r in results.get("results", [])
             ]
         except Exception:
-            return 4
+            return 4, []
 
         payload = {
             "idea_description": description[:300],
@@ -86,4 +101,4 @@ class TavilyResearcher:
             score = 4
 
         cache_set(query, self.SOURCE, {"score": score, "snippets": snippets})
-        return score
+        return score, snippets
