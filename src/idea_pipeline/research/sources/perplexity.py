@@ -15,6 +15,8 @@ from idea_pipeline.research.sources.base import (
     read_prompt,
 )
 
+from openai import OpenAI
+
 load_dotenv()
 
 _PERPLEXITY_BASE = "https://api.perplexity.ai"
@@ -26,7 +28,6 @@ class PerplexityResearcher:
     FIDELITY = "tier3"
 
     def __init__(self):
-        from openai import OpenAI
         api_key = os.environ.get("PERPLEXITY_API_KEY", "")
         if not api_key or api_key.startswith("pplx-..."):
             raise RuntimeError(
@@ -54,11 +55,23 @@ class PerplexityResearcher:
                 max_tokens=2048,
             )
             text = resp.choices[0].message.content or ""
+            citations: list[str] = getattr(resp, "citations", None) or []
             data = parse_json(text)
         except Exception as e:
             raise RuntimeError(f"Perplexity API error: {e}") from e
 
+        if not isinstance(data, dict):
+            return {}, ""
+
         scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
         narrative = data.get("narrative", "")
-        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        insights = data.get("insights") or {}
+        if not isinstance(insights, dict):
+            insights = {}
+        cache_set(cache_key, self.SOURCE, {
+            **scores,
+            "narrative": narrative,
+            "sources": citations,
+            "insights": insights,
+        })
         return scores, narrative

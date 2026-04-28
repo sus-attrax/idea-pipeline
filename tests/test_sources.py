@@ -72,3 +72,53 @@ def test_t2_sources_extracted_from_json():
     assert cached is not None
     assert "sources" in cached
     assert cached["sources"][0]["url"] == "https://gartner.com/report"
+
+
+def test_t3_citations_and_insights_cached():
+    """perplexity researcher captures resp.citations and insights from JSON."""
+    stored = {}
+
+    def fake_cache_set(query, source, data):
+        stored[(query, source)] = data
+
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = json.dumps({
+        "market_size": 2,
+        "market_potential": 2,
+        "prevalence": 3,
+        "market_awareness": 3,
+        "narrative": "Strong market.",
+        "insights": {
+            "timing": "New EU regulation opens niche.",
+            "bottlenecks": "Need 10 enterprise pilots.",
+            "risk_flags": ["Regulatory Risk"],
+            "risk_justification": "GDPR compliance required.",
+            "moat": "Proprietary dataset.",
+            "gtm_bottleneck": "First customer: mid-market CFO.",
+            "gross_margin": "SaaS >70% structurally fits.",
+            "verdict": "Pursue",
+            "verdict_reason": "Timing + clear moat.",
+            "next_step": "Interview 5 CFOs.",
+        },
+    })
+    mock_resp.citations = [
+        "https://perplexity.ai/cite/1",
+        "https://perplexity.ai/cite/2",
+    ]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = mock_resp
+
+    with patch("idea_pipeline.research.sources.perplexity.cache_get", return_value=None), \
+         patch("idea_pipeline.research.sources.perplexity.cache_set", fake_cache_set), \
+         patch("idea_pipeline.research.sources.perplexity.OpenAI", return_value=mock_client):
+        from idea_pipeline.research.sources.perplexity import PerplexityResearcher
+        r = PerplexityResearcher()
+        r.research_idea("pplx-idea", "B2B compliance tool")
+
+    cached = stored.get(("t3:pplx-idea", "perplexity_v1"))
+    assert cached is not None
+    assert cached["sources"] == ["https://perplexity.ai/cite/1", "https://perplexity.ai/cite/2"]
+    assert cached["insights"]["verdict"] == "Pursue"
+    assert cached["insights"]["timing"] == "New EU regulation opens niche."
