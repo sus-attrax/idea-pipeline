@@ -48,8 +48,12 @@ class ClaudeSearchResearcher:
         except Exception:
             return {}, ""
 
+        if not isinstance(data, dict):
+            return {}, ""
+
         scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
         narrative = data.get("narrative", "")
-        sources = data.get("sources", [])
+        raw_sources = data.get("sources", [])
+        sources = raw_sources if isinstance(raw_sources, list) else []
         cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative, "sources": sources})
         return scores, narrative
