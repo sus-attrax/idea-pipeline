@@ -154,7 +154,7 @@ def _fetch_or_synthesize_insights(
 
     insights_key = f"insights:v1:{idea_id}"
     cached_insights = cache_get(insights_key, "insights_v1")
-    if cached_insights:
+    if cached_insights and isinstance(cached_insights, dict):
         return cached_insights
 
     combined = "\n\n---\n\n".join(
