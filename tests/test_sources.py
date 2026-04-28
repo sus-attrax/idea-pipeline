@@ -37,3 +37,38 @@ def test_t1_sources_aggregated_per_idea():
     urls = [s["url"] for s in agg["sources"]]
     assert "https://example.com/a" in urls
     assert "https://example.com/b" in urls
+
+
+def test_t2_sources_extracted_from_json():
+    """claude_search caches a sources list from the LLM JSON response."""
+    stored = {}
+
+    def fake_cache_set(query, source, data):
+        stored[(query, source)] = data
+
+    mock_llm = MagicMock()
+    mock_llm.messages.create.return_value = MagicMock(
+        content=[MagicMock(text=json.dumps({
+            "market_size": 2,
+            "market_potential": 2,
+            "prevalence": 3,
+            "market_awareness": 3,
+            "narrative": "Big market.",
+            "sources": [
+                {"title": "Gartner Report", "url": "https://gartner.com/report"},
+                {"title": "Statista Data",  "url": "https://statista.com/data"},
+            ],
+        }))]
+    )
+
+    with patch("idea_pipeline.research.sources.claude_search.cache_get", return_value=None), \
+         patch("idea_pipeline.research.sources.claude_search.cache_set", fake_cache_set), \
+         patch("idea_pipeline.research.sources.claude_search.get_anthropic", return_value=mock_llm):
+        from idea_pipeline.research.sources.claude_search import ClaudeSearchResearcher
+        r = ClaudeSearchResearcher()
+        r.research_idea("my-idea", "An idea about X")
+
+    cached = stored.get(("t2:my-idea", "claude_search_v1"))
+    assert cached is not None
+    assert "sources" in cached
+    assert cached["sources"][0]["url"] == "https://gartner.com/report"

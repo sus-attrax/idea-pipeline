@@ -50,5 +50,6 @@ class ClaudeSearchResearcher:
 
         scores = {f: clamp(data[f]) for f in RESEARCH_FIELDS if data.get(f) is not None}
         narrative = data.get("narrative", "")
-        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative})
+        sources = data.get("sources", [])
+        cache_set(cache_key, self.SOURCE, {**scores, "narrative": narrative, "sources": sources})
         return scores, narrative

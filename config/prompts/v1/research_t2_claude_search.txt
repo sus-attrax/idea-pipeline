@@ -11,6 +11,7 @@ Then output a single JSON object (no markdown fences, no other text) with:
   - "prevalence": integer 1-6 or null
   - "market_awareness": integer 1-6 or null
   - "narrative": string — 4-6 sentences for a founder evaluating this idea. Must include: concrete $ market size, CAGR %, named competitors, top risk, key tailwind.
+  - "sources": array of {"title": string, "url": string} — every web page you actually fetched or cited
 
 Score meaning (1=best, 6=worst):
   market_size:       1=>$10B global, 6=<$10M niche
